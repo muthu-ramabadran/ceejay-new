@@ -5,17 +5,16 @@ import { useMemo, useState } from "react";
 import { ChatComposer } from "@/components/chat/chat-composer";
 import { MessageList } from "@/components/chat/message-list";
 import { CompanySidePanel } from "@/components/company/company-side-panel";
-import { useMockAgentChat } from "@/hooks/use-mock-agent-chat";
-import { MOCK_COMPANY_BY_ID } from "@/lib/mock/companies";
+import { useAgentChat } from "@/hooks/use-agent-chat";
 
 export function ChatShell(): React.JSX.Element {
-  const { messages, isLoading, activitySteps, sendMessage } = useMockAgentChat();
+  const { messages, isLoading, activitySteps, sendMessage, companiesById } = useAgentChat();
   const [selectedCompanyId, setSelectedCompanyId] = useState<string | null>(null);
   const [detailsOpen, setDetailsOpen] = useState(false);
 
   const selectedCompany = useMemo(
-    () => (selectedCompanyId ? MOCK_COMPANY_BY_ID[selectedCompanyId] ?? null : null),
-    [selectedCompanyId],
+    () => (selectedCompanyId ? companiesById[selectedCompanyId] ?? null : null),
+    [companiesById, selectedCompanyId],
   );
 
   function openCompany(companyId: string): void {

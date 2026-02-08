@@ -53,4 +53,7 @@ export interface CompanyReference {
   companyId: string;
   companyName: string;
   reason: string;
+  inlineDescription?: string;
+  evidenceChips?: string[];
+  confidence?: number;
 }
