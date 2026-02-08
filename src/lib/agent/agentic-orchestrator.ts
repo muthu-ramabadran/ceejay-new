@@ -144,11 +144,61 @@ function formatToolDetail(toolName: string, input: unknown): string {
   }
 }
 
+function summarizeToolOutput(toolName: string, result: unknown): Record<string, unknown> {
+  const data = result as Record<string, unknown>;
+  switch (toolName) {
+    case "search_exact_name":
+    case "search_semantic":
+    case "search_keyword":
+      return {
+        totalFound: data.totalFound,
+        resultCount: Array.isArray(data.results) ? data.results.length : 0,
+        topIds: Array.isArray(data.results)
+          ? (data.results as Array<{ companyId: string }>).slice(0, 5).map((r) => r.companyId)
+          : [],
+      };
+    case "search_taxonomy":
+      return {
+        totalFound: data.totalFound,
+        resultCount: Array.isArray(data.results) ? data.results.length : 0,
+      };
+    case "get_company_details":
+      return {
+        companyCount: Array.isArray(data.companies) ? data.companies.length : 0,
+        companyNames: Array.isArray(data.companies)
+          ? (data.companies as Array<{ company_name: string }>).slice(0, 5).map((c) => c.company_name)
+          : [],
+      };
+    case "clarify_with_user":
+      return { status: data.status };
+    case "finalize_search":
+      return {
+        status: data.status,
+        resultCount: data.resultCount,
+        overallConfidence: data.overallConfidence,
+      };
+    default:
+      return {};
+  }
+}
+
 function buildAgentMessages(messages: ChatMessage[]): Array<{ role: "user" | "assistant"; content: string }> {
-  return messages.slice(-6).map((message) => ({
-    role: message.role,
-    content: message.content,
-  }));
+  return messages.slice(-6).map((message) => {
+    // For assistant messages, include the company references so agent knows previous results
+    if (message.role === "assistant" && message.references && message.references.length > 0) {
+      const referenceSummary = message.references
+        .map((ref) => `- ${ref.companyName} (${ref.companyId}): ${ref.reason?.slice(0, 100) ?? ""}`)
+        .join("\n");
+      return {
+        role: message.role,
+        content: `${message.content}\n\nPrevious search results (company IDs for reference):\n${referenceSummary}`,
+      };
+    }
+    return {
+      role: message.role,
+      content: message.content,
+    };
+  });
 }
 
 function buildFallbackResponse(message: string): FinalAnswerPayload {
@@ -244,7 +294,7 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
 
   try {
     // Phase 1: Agentic search - LLM decides tools based on results
-    await generateText({
+    const agentResult = await generateText({
       model: openai(env.OPENAI_MODEL),
       system: agentSystemPrompt,
       messages: buildAgentMessages(input.messages),
@@ -256,8 +306,18 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
           throw new Error("Search timeout exceeded");
         }
 
+        // Build a map of tool results for logging
+        const toolResultsMap = new Map<string, unknown>();
+        for (const toolResult of step.toolResults ?? []) {
+          toolResultsMap.set(toolResult.toolCallId, "output" in toolResult ? toolResult.output : undefined);
+        }
+
         for (const toolCall of step.toolCalls ?? []) {
           context.stepCounter += 1;
+
+          // Get the result for this tool call
+          const result = toolResultsMap.get(toolCall.toolCallId);
+          const outputSummary = result ? summarizeToolOutput(toolCall.toolName, result) : {};
 
           // Log to telemetry
           await insertSearchRunStep(supabase, {
@@ -266,7 +326,7 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
             step_order: context.stepCounter,
             tool_name: `agent.${toolCall.toolName}`,
             input_summary: toolCall.input as Record<string, unknown>,
-            output_summary: {},
+            output_summary: outputSummary,
             duration_ms: 0,
             candidate_count_before: state.candidates.size,
             candidate_count_after: state.candidates.size,
@@ -295,6 +355,15 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
       },
     });
 
+    // Log agent reasoning for debugging
+    console.log(`[agentic-orchestrator] Agent finished. Steps: ${agentResult.steps.length}, finishReason: ${agentResult.finishReason}`);
+    if (agentResult.text) {
+      console.log(`[agentic-orchestrator] Agent text: ${agentResult.text.slice(0, 500)}`);
+    }
+    if (!state.preliminaryResults && state.candidates.size > 0) {
+      console.log(`[agentic-orchestrator] Agent has ${state.candidates.size} candidates but didn't call finalize_search`);
+    }
+
     // Check if we're waiting for clarification
     if (context.clarificationRequested && state.clarificationPending) {
       return null;
@@ -302,15 +371,32 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
 
     // Check if we got a finalize_search call
     if (!state.preliminaryResults) {
-      await updateSearchRun(supabase, runId, {
-        end_reason: "guardrail_hit",
-        tool_call_count: state.toolCallCount,
-        latency_ms: Date.now() - startedAtMs,
-      });
+      // Agent didn't call finalize_search, but we may have candidates - auto-finalize
+      if (state.candidates.size > 0) {
+        console.log(`[agentic-orchestrator] Agent didn't finalize. Auto-finalizing with ${state.candidates.size} candidates.`);
 
-      return buildFallbackResponse(
-        "Could not find relevant companies. Try adding more specific terms or company names."
-      );
+        // Sort candidates by combined score and take top 15
+        const sortedCandidates = Array.from(state.candidates.values())
+          .sort((a, b) => b.combinedScore - a.combinedScore)
+          .slice(0, 15);
+
+        state.preliminaryResults = sortedCandidates.map((candidate) => ({
+          companyId: candidate.companyId,
+          confidence: Math.min(candidate.combinedScore, 1),
+          reason: `Matched via ${candidate.matchedFields.join(", ")}`,
+          evidenceChips: candidate.matchedTerms.slice(0, 4),
+        }));
+      } else {
+        await updateSearchRun(supabase, runId, {
+          end_reason: "guardrail_hit",
+          tool_call_count: state.toolCallCount,
+          latency_ms: Date.now() - startedAtMs,
+        });
+
+        return buildFallbackResponse(
+          "Could not find relevant companies. Try adding more specific terms or company names."
+        );
+      }
     }
 
     await input.onActivity?.({
@@ -502,8 +588,18 @@ export async function resumeAgentWithClarification(
           throw new Error("Search timeout exceeded");
         }
 
+        // Build a map of tool results for logging
+        const toolResultsMap = new Map<string, unknown>();
+        for (const toolResult of step.toolResults ?? []) {
+          toolResultsMap.set(toolResult.toolCallId, "output" in toolResult ? toolResult.output : undefined);
+        }
+
         for (const toolCall of step.toolCalls ?? []) {
           stepCounter += 1;
+
+          // Get the result for this tool call
+          const result = toolResultsMap.get(toolCall.toolCallId);
+          const outputSummary = result ? summarizeToolOutput(toolCall.toolName, result) : {};
 
           await insertSearchRunStep(supabase, {
             run_id: pending.runId,
@@ -511,7 +607,7 @@ export async function resumeAgentWithClarification(
             step_order: stepCounter,
             tool_name: `agent.${toolCall.toolName}`,
             input_summary: toolCall.input as Record<string, unknown>,
-            output_summary: {},
+            output_summary: outputSummary,
             duration_ms: 0,
             candidate_count_before: pending.state.candidates.size,
             candidate_count_after: pending.state.candidates.size,
@@ -528,15 +624,31 @@ export async function resumeAgentWithClarification(
     });
 
     if (!pending.state.preliminaryResults) {
-      await updateSearchRun(supabase, pending.runId, {
-        end_reason: "guardrail_hit",
-        tool_call_count: pending.state.toolCallCount,
-        latency_ms: Date.now() - pending.startedAtMs,
-      });
+      // Agent didn't call finalize_search, but we may have candidates - auto-finalize
+      if (pending.state.candidates.size > 0) {
+        console.log(`[agentic-orchestrator] Agent didn't finalize after resume. Auto-finalizing with ${pending.state.candidates.size} candidates.`);
 
-      return buildFallbackResponse(
-        "Could not find relevant companies after clarification. Try a different search."
-      );
+        const sortedCandidates = Array.from(pending.state.candidates.values())
+          .sort((a, b) => b.combinedScore - a.combinedScore)
+          .slice(0, 15);
+
+        pending.state.preliminaryResults = sortedCandidates.map((candidate) => ({
+          companyId: candidate.companyId,
+          confidence: Math.min(candidate.combinedScore, 1),
+          reason: `Matched via ${candidate.matchedFields.join(", ")}`,
+          evidenceChips: candidate.matchedTerms.slice(0, 4),
+        }));
+      } else {
+        await updateSearchRun(supabase, pending.runId, {
+          end_reason: "guardrail_hit",
+          tool_call_count: pending.state.toolCallCount,
+          latency_ms: Date.now() - pending.startedAtMs,
+        });
+
+        return buildFallbackResponse(
+          "Could not find relevant companies after clarification. Try a different search."
+        );
+      }
     }
 
     await input.onActivity?.({

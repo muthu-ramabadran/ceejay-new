@@ -161,7 +161,7 @@ const semanticSearchSchema = z.object({
   excludeCompanyIds: z
     .array(z.string())
     .optional()
-    .describe("Company IDs to exclude from results (e.g., anchor company)"),
+    .describe("Use to exclude company IDs from results. Use cases: (1) 'companies like X' - exclude the anchor company, (2) 'more results' - exclude ALL previously returned company IDs to avoid duplicates. DO NOT use for 'filter' requests."),
 });
 
 const keywordSearchSchema = z.object({
@@ -200,8 +200,8 @@ const clarifySchema = z.object({
 const companyDetailsSchema = z.object({
   companyIds: z
     .array(z.string())
-    .max(10)
-    .describe("Company IDs to get details for"),
+    .max(25)
+    .describe("Company IDs to get details for (up to 25 at a time)"),
 });
 
 const finalizeSchema = z.object({
@@ -216,8 +216,8 @@ const finalizeSchema = z.object({
         evidenceChips: z.array(z.string()).max(4),
       })
     )
-    .max(15)
-    .describe("Ranked list of company results"),
+    .max(50)
+    .describe("Ranked list of company results (return more when user asks for more)"),
   overallConfidence: z
     .number()
     .min(0)
@@ -263,11 +263,13 @@ Use when user mentions a specific company name.`,
       description: `Semantic search based on meaning. Searches: description, product_description,
 problem_solved, target_customer, differentiator, niches.
 
-IMPORTANT: This searches WHAT companies do, not just keywords. A query like "AI coding agents"
-may return both companies that ARE coding agents AND companies that BUILD agent infrastructure.
-Analyze results carefully to check if they match user intent.
+BEST PRACTICE: Call this 2-3 times with different query phrasings for better coverage.
+Example for "voice agents": call with "voice agents", "voice AI assistants", "conversational voice AI"
 
-The 'niches' field contains curated capability phrases - often the best signal for matching.`,
+IMPORTANT: A query like "AI coding agents" may return mixed results. Analyze carefully.
+
+For FILTER requests ("filter to customer support"): DO NOT use excludeCompanyIds with previous results.
+Only use excludeCompanyIds for "companies like X" to exclude the anchor company.`,
       inputSchema: semanticSearchSchema,
       execute: async ({ query, searchFocus, excludeCompanyIds }: z.infer<typeof semanticSearchSchema>) => {
         ctx.state.toolCallCount += 1;
@@ -404,8 +406,9 @@ Do NOT skip this for genuinely ambiguous queries just because you found results.
     }),
 
     get_company_details: tool({
-      description: `Get full company profiles. Use after search to understand what companies actually do.
-Essential for analyzing whether search results match user intent.`,
+      description: `Get full company profiles (up to 25 at a time). Use after search to understand what companies actually do.
+Essential for analyzing whether search results match user intent.
+Call MULTIPLE TIMES if you need details for more than 25 companies (e.g., for large result sets).`,
       inputSchema: companyDetailsSchema,
       execute: async ({ companyIds }: z.infer<typeof companyDetailsSchema>) => {
         ctx.state.toolCallCount += 1;
