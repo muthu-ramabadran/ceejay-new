@@ -3,12 +3,21 @@
 import { useMemo, useState } from "react";
 
 import { ChatComposer } from "@/components/chat/chat-composer";
+import { ClarificationPrompt } from "@/components/chat/clarification-prompt";
 import { MessageList } from "@/components/chat/message-list";
 import { CompanySidePanel } from "@/components/company/company-side-panel";
 import { useAgentChat } from "@/hooks/use-agent-chat";
 
 export function ChatShell(): React.JSX.Element {
-  const { messages, isLoading, activitySteps, sendMessage, companiesById } = useAgentChat();
+  const {
+    messages,
+    isLoading,
+    activitySteps,
+    sendMessage,
+    companiesById,
+    clarificationPending,
+    handleClarificationResponse,
+  } = useAgentChat();
   const [selectedCompanyId, setSelectedCompanyId] = useState<string | null>(null);
   const [detailsOpen, setDetailsOpen] = useState(false);
 
@@ -55,7 +64,17 @@ export function ChatShell(): React.JSX.Element {
               onOpenReference={openCompany}
             />
           </div>
-          <ChatComposer onSubmit={sendMessage} disabled={isLoading} />
+
+          {clarificationPending ? (
+            <ClarificationPrompt
+              question={clarificationPending.question}
+              options={clarificationPending.options}
+              onSelect={handleClarificationResponse}
+              disabled={isLoading}
+            />
+          ) : null}
+
+          <ChatComposer onSubmit={sendMessage} disabled={isLoading || clarificationPending !== null} />
         </section>
 
         {detailsOpen ? (
