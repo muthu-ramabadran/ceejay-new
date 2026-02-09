@@ -19,6 +19,8 @@ interface RawCompanyRow {
   ats_platform: string | null;
   ats_jobs_url: string | null;
   total_raised: string | null;
+  total_raised_amount?: number | string | null;
+  total_raised_currency_code?: string | null;
   funding_rounds: unknown;
   investors: unknown;
   team_size: string | null;
@@ -118,6 +120,19 @@ function parseIssues(value: unknown): unknown[] {
   return Array.isArray(parsed) ? parsed : [];
 }
 
+function parseNullableNumber(value: unknown): number | null {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+}
+
 function normalizeCompany(row: RawCompanyRow): Company {
   return {
     id: row.id,
@@ -137,6 +152,8 @@ function normalizeCompany(row: RawCompanyRow): Company {
     ats_platform: row.ats_platform,
     ats_jobs_url: row.ats_jobs_url,
     total_raised: row.total_raised,
+    total_raised_amount: parseNullableNumber(row.total_raised_amount),
+    total_raised_currency_code: row.total_raised_currency_code ?? null,
     funding_rounds: parseFundingRounds(row.funding_rounds),
     investors: parseStringArray(row.investors),
     team_size: row.team_size,

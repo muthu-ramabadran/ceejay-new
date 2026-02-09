@@ -31,6 +31,8 @@ export interface Company {
   ats_platform: string | null;
   ats_jobs_url: string | null;
   total_raised: string | null;
+  total_raised_amount: number | null;
+  total_raised_currency_code: string | null;
   funding_rounds: FundingRound[];
   investors: string[];
   team_size: string | null;

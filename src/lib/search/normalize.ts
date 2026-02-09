@@ -74,6 +74,19 @@ function parseUnknownArray(value: unknown): unknown[] {
   return Array.isArray(parsed) ? parsed : [];
 }
 
+function parseNullableNumber(value: unknown): number | null {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+}
+
 export function normalizeCompanyRow(row: Record<string, unknown>): Company {
   return {
     id: String(row.id ?? ""),
@@ -93,6 +106,9 @@ export function normalizeCompanyRow(row: Record<string, unknown>): Company {
     ats_platform: typeof row.ats_platform === "string" ? row.ats_platform : null,
     ats_jobs_url: typeof row.ats_jobs_url === "string" ? row.ats_jobs_url : null,
     total_raised: typeof row.total_raised === "string" ? row.total_raised : null,
+    total_raised_amount: parseNullableNumber(row.total_raised_amount),
+    total_raised_currency_code:
+      typeof row.total_raised_currency_code === "string" ? row.total_raised_currency_code : null,
     funding_rounds: parseFundingRounds(row.funding_rounds),
     investors: parseStringArray(row.investors),
     team_size: typeof row.team_size === "string" ? row.team_size : null,

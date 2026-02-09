@@ -202,9 +202,10 @@ When user says "filter to X", "narrow to X", "which of these are X":
 
 ### When to use clarify_with_user (IMPORTANT)
 MUST use clarify_with_user when:
-- Query contains "AI agents", "coding agents", "AI assistants", or similar ambiguous terms
-- After getting company details, you see results that fall into 2+ distinct categories
-- Example: Results include BOTH "Charlie Labs" (coding assistant) AND "CrewAI" (agent framework)
+- Query contains "AI agents", "AI companies" or similar terms which are too broad. A good query is specific which includes things like what the company does, what it's products are, what it's target customers are, etc. When that clarity is not there, ask for clarification.
+- Or you search results for a query and realise based on the results that the query is too broad and needs to be clarified.
+- Example: Lets say user queried for "AI coding agents" and the Results include BOTH "Charlie Labs" (coding assistant) AND "CrewAI" (agent framework) for building AI agents.
+- Wehn you read company results you can clarigfy and further do searches.
 
 Do NOT skip clarification just because you found results. Mixed results = wrong results.
 

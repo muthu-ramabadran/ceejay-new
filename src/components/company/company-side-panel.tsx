@@ -76,6 +76,21 @@ export function CompanySidePanel({ company, onClose }: CompanySidePanelProps): R
 
   const foundersRows = company.founders.filter((founder) => hasValue(founder.name));
   const fundingRows = company.funding_rounds;
+  const uniqueInvestors = Array.from(
+    company.investors.reduce((investorMap, investor) => {
+      const trimmed = investor.trim();
+      if (!trimmed) {
+        return investorMap;
+      }
+
+      const normalizedInvestor = trimmed.toLowerCase();
+      if (!investorMap.has(normalizedInvestor)) {
+        investorMap.set(normalizedInvestor, trimmed);
+      }
+
+      return investorMap;
+    }, new Map<string, string>()),
+  ).map(([key, value]) => ({ key, value }));
   const socialEntries = Object.entries(company.social_links).filter((entry) => hasValue(entry[1]));
   const tagsExist =
     company.sectors.length > 0 ||
@@ -184,13 +199,13 @@ export function CompanySidePanel({ company, onClose }: CompanySidePanelProps): R
           </section>
         ) : null}
 
-        {company.investors.length ? (
+        {uniqueInvestors.length ? (
           <section>
             <SectionTitle>Investors</SectionTitle>
             <ul className="space-y-1.5 text-sm text-[var(--text-secondary)]">
-              {company.investors.map((investor) => (
-                <li key={investor} className="leading-6">
-                  {investor}
+              {uniqueInvestors.map((investor) => (
+                <li key={investor.key} className="leading-6">
+                  {investor.value}
                 </li>
               ))}
             </ul>
