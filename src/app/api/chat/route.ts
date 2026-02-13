@@ -1,5 +1,6 @@
 import type { ChatMessage, ClarificationRequestData } from "@/types/chat";
 import { runAgenticSearch, resumeAgentWithClarification } from "@/lib/agent/agentic-orchestrator";
+import { SEARCH_UNAVAILABLE_MESSAGE } from "@/lib/search/user-facing-errors";
 
 export const runtime = "nodejs";
 
@@ -63,8 +64,8 @@ export async function POST(request: Request): Promise<Response> {
             })
           );
         } catch (error) {
-          const message = error instanceof Error ? error.message : "Search failed";
-          controller.enqueue(encodeEvent({ type: "error", data: { message } }));
+          console.error("[api/chat] Failed to resume search", error);
+          controller.enqueue(encodeEvent({ type: "error", data: { message: SEARCH_UNAVAILABLE_MESSAGE } }));
         } finally {
           controller.close();
         }
@@ -133,8 +134,8 @@ export async function POST(request: Request): Promise<Response> {
           );
         }
       } catch (error) {
-        const message = error instanceof Error ? error.message : "Search failed";
-        controller.enqueue(encodeEvent({ type: "error", data: { message } }));
+        console.error("[api/chat] Failed to run search", error);
+        controller.enqueue(encodeEvent({ type: "error", data: { message: SEARCH_UNAVAILABLE_MESSAGE } }));
       } finally {
         controller.close();
       }

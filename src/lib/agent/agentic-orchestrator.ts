@@ -8,6 +8,7 @@ import { createSearchTools, type PreliminaryResult, type SearchAgentState } from
 import { getCompaniesByIds } from "@/lib/search/rpc";
 import { insertSearchRun, insertSearchRunResults, insertSearchRunStep, updateSearchRun } from "@/lib/search/telemetry";
 import type { FinalAnswerPayload } from "@/lib/search/types";
+import { SEARCH_UNAVAILABLE_MESSAGE } from "@/lib/search/user-facing-errors";
 import { getSupabaseServerClient } from "@/lib/supabase/server";
 import type { AgentActivityEventPayload, ChatMessage, ClarificationOption } from "@/types/chat";
 import type { Company } from "@/types/company";
@@ -691,7 +692,7 @@ Overall confidence: ${(rerankerData.confidence * 100).toFixed(0)}%. Focus on wha
       },
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Search failed";
+    console.error("[agentic-orchestrator] Search run failed", error);
 
     await updateSearchRun(supabase, runId, {
       end_reason: "error",
@@ -699,7 +700,7 @@ Overall confidence: ${(rerankerData.confidence * 100).toFixed(0)}%. Focus on wha
       latency_ms: Date.now() - startedAtMs,
     });
 
-    return buildFallbackResponse(`Search failed: ${message}`);
+    return buildFallbackResponse(SEARCH_UNAVAILABLE_MESSAGE);
   }
 }
 
@@ -983,7 +984,7 @@ Overall confidence: ${(rerankerData.confidence * 100).toFixed(0)}%. Focus on wha
       },
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Search failed";
+    console.error("[agentic-orchestrator] Resume search failed", error);
 
     await updateSearchRun(supabase, pending.runId, {
       end_reason: "error",
@@ -991,7 +992,7 @@ Overall confidence: ${(rerankerData.confidence * 100).toFixed(0)}%. Focus on wha
       latency_ms: Date.now() - pending.startedAtMs,
     });
 
-    return buildFallbackResponse(`Search failed: ${message}`);
+    return buildFallbackResponse(SEARCH_UNAVAILABLE_MESSAGE);
   }
 }
 

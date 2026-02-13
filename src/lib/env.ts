@@ -1,3 +1,4 @@
+import "server-only";
 import { z } from "zod";
 
 const serverEnvSchema = z.object({
@@ -19,7 +20,8 @@ export function getServerEnv(): ServerEnv {
 
   const parsed = serverEnvSchema.safeParse(process.env);
   if (!parsed.success) {
-    throw new Error(`Invalid server env: ${parsed.error.message}`);
+    console.error("[env] Invalid server env", parsed.error.flatten());
+    throw new Error("Invalid server environment configuration.");
   }
 
   cachedEnv = parsed.data;

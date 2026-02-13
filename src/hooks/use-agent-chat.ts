@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { SEARCH_UNAVAILABLE_MESSAGE } from "@/lib/search/user-facing-errors";
 import type { AgentActivityStep, AgentStreamEvent, ChatMessage, ClarificationRequestData } from "@/types/chat";
 import type { Company, CompanyReference } from "@/types/company";
 
@@ -150,11 +151,11 @@ export function useAgentChat(options?: UseAgentChatOptions): UseAgentChatResult 
 
         await processStream(response);
       } catch (error) {
+        console.error("[use-agent-chat] Search request failed", error);
         if (mountedRef.current) {
-          const message = error instanceof Error ? error.message : "Search failed";
           setMessages((previous) => [
             ...previous,
-            createMessage("assistant", `Search failed: ${message}`),
+            createMessage("assistant", SEARCH_UNAVAILABLE_MESSAGE),
           ]);
           setActivitySteps([]);
         }
@@ -164,7 +165,7 @@ export function useAgentChat(options?: UseAgentChatOptions): UseAgentChatResult 
         }
       }
     },
-    [isLoading, messages, processStream, clarificationPending]
+    [isLoading, messages, processStream]
   );
 
   const handleClarificationResponse = useCallback(
@@ -196,11 +197,11 @@ export function useAgentChat(options?: UseAgentChatOptions): UseAgentChatResult 
 
         await processStream(response);
       } catch (error) {
+        console.error("[use-agent-chat] Clarification resume failed", error);
         if (mountedRef.current) {
-          const message = error instanceof Error ? error.message : "Search failed";
           setMessages((previous) => [
             ...previous,
-            createMessage("assistant", `Search failed: ${message}`),
+            createMessage("assistant", SEARCH_UNAVAILABLE_MESSAGE),
           ]);
           setActivitySteps([]);
         }
