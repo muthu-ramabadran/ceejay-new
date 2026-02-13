@@ -8,6 +8,10 @@ import "@fontsource/dm-sans/600.css";
 export const metadata: Metadata = {
   title: "Ceejay - Startup Search",
   description: "Mock chat interface for startup discovery over company profiles.",
+  icons: {
+    icon: "/icon.png",
+    apple: "/apple-icon.png",
+  },
 };
 
 export default function RootLayout({

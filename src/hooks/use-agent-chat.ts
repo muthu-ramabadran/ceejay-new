@@ -24,6 +24,11 @@ function normalizeActivity(previous: AgentActivityStep[], incoming: AgentActivit
   return previous.map((step) => (step.id === incoming.id ? incoming : step));
 }
 
+export interface UseAgentChatOptions {
+  initialMessages?: ChatMessage[];
+  initialCompaniesById?: Record<string, Company>;
+}
+
 export interface UseAgentChatResult {
   messages: ChatMessage[];
   isLoading: boolean;
@@ -34,11 +39,11 @@ export interface UseAgentChatResult {
   handleClarificationResponse: (selection: string) => Promise<void>;
 }
 
-export function useAgentChat(): UseAgentChatResult {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+export function useAgentChat(options?: UseAgentChatOptions): UseAgentChatResult {
+  const [messages, setMessages] = useState<ChatMessage[]>(options?.initialMessages ?? []);
   const [isLoading, setIsLoading] = useState(false);
   const [activitySteps, setActivitySteps] = useState<AgentActivityStep[]>([]);
-  const [companiesById, setCompaniesById] = useState<Record<string, Company>>({});
+  const [companiesById, setCompaniesById] = useState<Record<string, Company>>(options?.initialCompaniesById ?? {});
   const [clarificationPending, setClarificationPending] = useState<ClarificationRequestData | null>(null);
 
   const sessionIdRef = useRef<string>(crypto.randomUUID());

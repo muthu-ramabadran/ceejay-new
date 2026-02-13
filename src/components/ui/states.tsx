@@ -17,7 +17,7 @@ function BaseState({ icon, title, description }: StateProps & { icon: React.JSX.
 
 export function EmptyState({
   title = "Start a company search",
-  description = "Ask for startups by domain, niche, or style. The timeline below will show what the agent is doing.",
+  description = "Ask for startups by domain, what they do, or who their customers are.",
 }: Partial<StateProps>): React.JSX.Element {
   return (
     <BaseState
