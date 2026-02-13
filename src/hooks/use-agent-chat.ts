@@ -25,6 +25,13 @@ function normalizeActivity(previous: AgentActivityStep[], incoming: AgentActivit
   return previous.map((step) => (step.id === incoming.id ? incoming : step));
 }
 
+function shouldLogClientError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return true;
+  }
+  return error.message !== SEARCH_UNAVAILABLE_MESSAGE;
+}
+
 export interface UseAgentChatOptions {
   initialMessages?: ChatMessage[];
   initialCompaniesById?: Record<string, Company>;
@@ -151,7 +158,9 @@ export function useAgentChat(options?: UseAgentChatOptions): UseAgentChatResult 
 
         await processStream(response);
       } catch (error) {
-        console.error("[use-agent-chat] Search request failed", error);
+        if (shouldLogClientError(error)) {
+          console.error("[use-agent-chat] Search request failed", error);
+        }
         if (mountedRef.current) {
           setMessages((previous) => [
             ...previous,
@@ -197,7 +206,9 @@ export function useAgentChat(options?: UseAgentChatOptions): UseAgentChatResult 
 
         await processStream(response);
       } catch (error) {
-        console.error("[use-agent-chat] Clarification resume failed", error);
+        if (shouldLogClientError(error)) {
+          console.error("[use-agent-chat] Clarification resume failed", error);
+        }
         if (mountedRef.current) {
           setMessages((previous) => [
             ...previous,
