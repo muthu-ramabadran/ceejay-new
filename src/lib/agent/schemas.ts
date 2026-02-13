@@ -23,7 +23,7 @@ export type PlannerOutput = z.infer<typeof plannerSchema>;
 
 export const rerankerSchema = z.object({
   confidence: z.number().min(0).max(1),
-  rankedCompanyIds: z.array(z.string()).min(1).max(30),
+  rankedCompanyIds: z.array(z.string()).min(1).max(50),
   perCompany: z.array(
     z.object({
       companyId: z.string(),

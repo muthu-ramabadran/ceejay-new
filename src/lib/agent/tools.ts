@@ -37,7 +37,16 @@ export interface SearchAgentState {
   candidates: Map<string, SearchCandidate>;
   anchorCompany: Company | null;
   toolCallCount: number;
+  retrievalQueryLog: string[];
+  enforceQueryVariation: boolean;
+  hasHighConfidenceExactMatch: boolean;
   preliminaryResults: PreliminaryResult[] | null;
+  targetResultCount: number;
+  defaultExcludeCompanyIds: string[];
+  constrainToCompanyIds: string[] | null;
+  companyDetailsFetchedCount: number;
+  requireClarificationBeforeFinalize: boolean;
+  clarificationSatisfied: boolean;
   clarificationPending: {
     question: string;
     options: ClarificationOption[];
@@ -145,6 +154,44 @@ function mergeCandidates(
   }
 }
 
+function dedupeCompanyIds(companyIds: string[]): string[] {
+  return Array.from(new Set(companyIds.filter(Boolean)));
+}
+
+function applyCompanyIdConstraints(
+  companyIds: string[],
+  state: SearchAgentState
+): string[] {
+  const constrainedIds = dedupeCompanyIds(companyIds);
+  const excludeSet = new Set(state.defaultExcludeCompanyIds);
+  const includeSet = state.constrainToCompanyIds ? new Set(state.constrainToCompanyIds) : null;
+
+  return constrainedIds.filter((companyId) => {
+    if (excludeSet.has(companyId)) {
+      return false;
+    }
+    if (includeSet && !includeSet.has(companyId)) {
+      return false;
+    }
+    return true;
+  });
+}
+
+function effectiveSearchLimit(targetResultCount: number): number {
+  return Math.min(200, Math.max(60, targetResultCount * 4));
+}
+
+function normalizeQueryForLog(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function recordRetrievalQuery(state: SearchAgentState, query: string): void {
+  const normalized = normalizeQueryForLog(query);
+  if (normalized) {
+    state.retrievalQueryLog.push(normalized);
+  }
+}
+
 // Input schemas for tools
 const exactNameSchema = z.object({
   companyName: z.string().describe("The company name to search for"),
@@ -161,7 +208,7 @@ const semanticSearchSchema = z.object({
   excludeCompanyIds: z
     .array(z.string())
     .optional()
-    .describe("Use to exclude company IDs from results. Use cases: (1) 'companies like X' - exclude the anchor company, (2) 'more results' - exclude ALL previously returned company IDs to avoid duplicates. DO NOT use for 'filter' requests."),
+    .describe("Optional additional company IDs to exclude from this semantic search."),
 });
 
 const keywordSearchSchema = z.object({
@@ -216,6 +263,7 @@ const finalizeSchema = z.object({
         evidenceChips: z.array(z.string()).max(4),
       })
     )
+    .min(1)
     .max(50)
     .describe("Ranked list of company results (return more when user asks for more)"),
   overallConfidence: z
@@ -229,11 +277,12 @@ const finalizeSchema = z.object({
 export function createSearchTools(ctx: ToolContext) {
   return {
     search_exact_name: tool({
-      description: `Find a company by exact name. Returns name similarity score (>=0.95 = exact match).
-Use when user mentions a specific company name.`,
+      description: "Find a company by exact name using fuzzy + trigram matching.",
       inputSchema: exactNameSchema,
       execute: async ({ companyName }: z.infer<typeof exactNameSchema>) => {
         ctx.state.toolCallCount += 1;
+        recordRetrievalQuery(ctx.state, companyName);
+        const candidateCountBefore = ctx.state.candidates.size;
 
         const rows = await searchExactName(ctx.supabase, {
           queryText: companyName,
@@ -241,38 +290,47 @@ Use when user mentions a specific company name.`,
           limit: 10,
         });
 
-        const candidates = rows.map((row) =>
+        const constrainedRows = rows.filter((row) =>
+          applyCompanyIdConstraints([row.companyId], ctx.state).length > 0
+        );
+        if (constrainedRows.some((row) => row.nameScore >= 0.95)) {
+          ctx.state.hasHighConfidenceExactMatch = true;
+        }
+
+        const candidates = constrainedRows.map((row) =>
           buildCandidateFromExact(row.companyId, row.nameScore, row.matchedName)
         );
         mergeCandidates(ctx.state.candidates, candidates);
+        const candidateCountAfter = ctx.state.candidates.size;
 
         return {
-          results: rows.map((row) => ({
+          results: constrainedRows.map((row) => ({
             companyId: row.companyId,
             companyName: row.matchedName,
             nameScore: row.nameScore,
             isExactMatch: row.nameScore >= 0.95,
           })),
-          totalFound: rows.length,
+          totalFound: constrainedRows.length,
           queryUsed: companyName,
+          candidateCountBefore,
+          candidateCountAfter,
         };
       },
     }),
 
     search_semantic: tool({
-      description: `Semantic search based on meaning. Searches: description, product_description,
-problem_solved, target_customer, differentiator, niches.
-
-BEST PRACTICE: Call this 2-3 times with different query phrasings for better coverage.
-Example for "voice agents": call with "voice agents", "voice AI assistants", "conversational voice AI"
-
-IMPORTANT: A query like "AI coding agents" may return mixed results. Analyze carefully.
-
-For FILTER requests ("filter to customer support"): DO NOT use excludeCompanyIds with previous results.
-Only use excludeCompanyIds for "companies like X" to exclude the anchor company.`,
+      description: "Semantic retrieval across company profile fields (description/product/problem/customer/niches).",
       inputSchema: semanticSearchSchema,
       execute: async ({ query, searchFocus, excludeCompanyIds }: z.infer<typeof semanticSearchSchema>) => {
         ctx.state.toolCallCount += 1;
+        recordRetrievalQuery(ctx.state, query);
+        const candidateCountBefore = ctx.state.candidates.size;
+        const mergedExcludeIds = dedupeCompanyIds([
+          ...(excludeCompanyIds ?? []),
+          ...ctx.state.defaultExcludeCompanyIds,
+        ]);
+        const includeIds = ctx.state.constrainToCompanyIds ?? undefined;
+        const limit = effectiveSearchLimit(ctx.state.targetResultCount);
 
         const embedding = await ctx.embedQuery(query);
 
@@ -280,103 +338,124 @@ Only use excludeCompanyIds for "companies like X" to exclude the anchor company.
           queryText: query,
           queryEmbedding: embedding,
           statuses: ["startup"],
-          excludeIds: excludeCompanyIds,
-          limit: 50,
+          includeIds,
+          excludeIds: mergedExcludeIds.length ? mergedExcludeIds : undefined,
+          limit,
           minSemantic: 0.25,
         });
 
-        const candidates = rows.map(buildCandidateFromHybrid);
+        const constrainedRows = rows.filter((row) =>
+          applyCompanyIdConstraints([row.companyId], ctx.state).length > 0
+        );
+        const candidates = constrainedRows.map(buildCandidateFromHybrid);
         mergeCandidates(ctx.state.candidates, candidates);
+        const candidateCountAfter = ctx.state.candidates.size;
+        const previewLimit = Math.max(15, Math.min(60, ctx.state.targetResultCount));
 
         return {
-          results: rows.slice(0, 15).map((row) => ({
+          results: constrainedRows.slice(0, previewLimit).map((row) => ({
             companyId: row.companyId,
             matchedFields: row.matchedFields,
             matchedTerms: row.matchedTerms,
             semanticScore: Number(row.semanticScore.toFixed(3)),
             combinedScore: Number(row.combinedScore.toFixed(3)),
           })),
-          totalFound: rows.length,
+          totalFound: constrainedRows.length,
           queryUsed: query,
           searchFocus: searchFocus ?? "broad",
+          candidateCountBefore,
+          candidateCountAfter,
         };
       },
     }),
 
     search_keyword: tool({
-      description: `Exact keyword match. Use for specific technical terms, product names, integrations
-that semantic search might miss. Good for disambiguation when semantic returns mixed results.`,
+      description: "Lexical keyword retrieval for exact terminology and disambiguation.",
       inputSchema: keywordSearchSchema,
       execute: async ({ keywords }: z.infer<typeof keywordSearchSchema>) => {
         ctx.state.toolCallCount += 1;
+        recordRetrievalQuery(ctx.state, keywords);
+        const candidateCountBefore = ctx.state.candidates.size;
+        const limit = effectiveSearchLimit(ctx.state.targetResultCount);
 
         const rows = await searchKeyword(ctx.supabase, {
           queryText: keywords,
           statuses: ["startup"],
-          limit: 50,
+          limit,
         });
 
-        const candidates = rows.map(buildCandidateFromKeyword);
+        const constrainedRows = rows.filter((row) =>
+          applyCompanyIdConstraints([row.companyId], ctx.state).length > 0
+        );
+        const candidates = constrainedRows.map(buildCandidateFromKeyword);
         mergeCandidates(ctx.state.candidates, candidates);
+        const candidateCountAfter = ctx.state.candidates.size;
+        const previewLimit = Math.max(15, Math.min(60, ctx.state.targetResultCount));
 
         return {
-          results: rows.slice(0, 15).map((row) => ({
+          results: constrainedRows.slice(0, previewLimit).map((row) => ({
             companyId: row.companyId,
             matchedTerms: row.matchedTerms,
             keywordScore: Number(row.keywordScore.toFixed(3)),
             combinedScore: Number(row.combinedScore.toFixed(3)),
           })),
-          totalFound: rows.length,
+          totalFound: constrainedRows.length,
           queryUsed: keywords,
+          candidateCountBefore,
+          candidateCountAfter,
         };
       },
     }),
 
     search_taxonomy: tool({
-      description: `Filter by industry vertical, category, and business model.
-Use the exact sector/category names from the taxonomy in the system prompt.`,
+      description: "Taxonomy filter using sector/category/business model labels.",
       inputSchema: taxonomySearchSchema,
       execute: async ({ sectors, categories, businessModels }: z.infer<typeof taxonomySearchSchema>) => {
         ctx.state.toolCallCount += 1;
+        const taxonomySignature = [
+          "taxonomy",
+          ...(sectors ?? []),
+          ...(categories ?? []),
+          ...(businessModels ?? []),
+        ].join("|");
+        recordRetrievalQuery(ctx.state, taxonomySignature);
+        const candidateCountBefore = ctx.state.candidates.size;
+        const limit = effectiveSearchLimit(ctx.state.targetResultCount);
 
         const rows = await searchByTaxonomy(ctx.supabase, {
           sectors: sectors ?? [],
           categories: categories ?? [],
           businessModels: businessModels ?? [],
           statuses: ["startup"],
-          limit: 100,
+          limit,
         });
 
-        const candidates = rows.map(buildCandidateFromTaxonomy);
+        const constrainedRows = rows.filter((row) =>
+          applyCompanyIdConstraints([row.companyId], ctx.state).length > 0
+        );
+        const candidates = constrainedRows.map(buildCandidateFromTaxonomy);
         mergeCandidates(ctx.state.candidates, candidates);
+        const candidateCountAfter = ctx.state.candidates.size;
+        const previewLimit = Math.max(20, Math.min(80, ctx.state.targetResultCount * 2));
 
         return {
-          results: rows.slice(0, 20).map((row) => ({
+          results: constrainedRows.slice(0, previewLimit).map((row) => ({
             companyId: row.companyId,
             sectorHits: row.sectorHits,
             categoryHits: row.categoryHits,
             modelHits: row.modelHits,
             tagScore: Number(row.tagScore.toFixed(3)),
           })),
-          totalFound: rows.length,
+          totalFound: constrainedRows.length,
           filtersUsed: { sectors, categories, businessModels },
+          candidateCountBefore,
+          candidateCountAfter,
         };
       },
     }),
 
     clarify_with_user: tool({
-      description: `IMPORTANT: Ask the user to clarify their intent when query is ambiguous.
-
-MUST use this when:
-- Query is "AI agents", "AI coding agents", "coding agents", or similar
-- After get_company_details, results include BOTH coding assistants (tools that write code) AND agent frameworks (tools to build agents)
-- Example: If results contain both "Charlie Labs" (AI coding assistant) and "CrewAI" (agent framework), MUST clarify
-
-Good clarification options for "AI coding agents":
-- "AI coding assistants" - Tools that help developers write code (like Cursor, GitHub Copilot)
-- "AI agent frameworks" - Infrastructure to build and deploy AI agents (like CrewAI, LangChain)
-
-Do NOT skip this for genuinely ambiguous queries just because you found results.`,
+      description: "Ask the user to choose intent when results are split across multiple plausible interpretations.",
       inputSchema: clarifySchema,
       execute: async ({ question, options }: z.infer<typeof clarifySchema>) => {
         ctx.state.clarificationPending = { question, options };
@@ -390,10 +469,13 @@ Do NOT skip this for genuinely ambiguous queries just because you found results.
           const selection = ctx.state.clarificationResponse;
           ctx.state.clarificationResponse = null;
           ctx.state.clarificationPending = null;
+          ctx.state.clarificationSatisfied = true;
           return {
             status: "answered",
             userSelection: selection,
             message: `User selected: "${selection}". Continue searching based on this choice.`,
+            candidateCountBefore: ctx.state.candidates.size,
+            candidateCountAfter: ctx.state.candidates.size,
           };
         }
 
@@ -401,19 +483,21 @@ Do NOT skip this for genuinely ambiguous queries just because you found results.
         return {
           status: "awaiting_user",
           message: "Waiting for user to select an option. The search will resume after they respond.",
+          candidateCountBefore: ctx.state.candidates.size,
+          candidateCountAfter: ctx.state.candidates.size,
         };
       },
     }),
 
     get_company_details: tool({
-      description: `Get full company profiles (up to 25 at a time). Use after search to understand what companies actually do.
-Essential for analyzing whether search results match user intent.
-Call MULTIPLE TIMES if you need details for more than 25 companies (e.g., for large result sets).`,
+      description: "Fetch full company profiles for validation and ranking. Use multiple calls for large sets.",
       inputSchema: companyDetailsSchema,
       execute: async ({ companyIds }: z.infer<typeof companyDetailsSchema>) => {
         ctx.state.toolCallCount += 1;
+        const candidateCountBefore = ctx.state.candidates.size;
+        const constrainedIds = applyCompanyIdConstraints(companyIds, ctx.state).slice(0, 25);
 
-        const companies = await getCompaniesByIds(ctx.supabase, companyIds);
+        const companies = await getCompaniesByIds(ctx.supabase, constrainedIds);
 
         // Update candidate info with company names
         for (const company of companies) {
@@ -424,6 +508,10 @@ Call MULTIPLE TIMES if you need details for more than 25 companies (e.g., for la
             candidate.matchedNiches = company.niches.slice(0, 5);
           }
         }
+        if (companies.length > 0) {
+          ctx.state.companyDetailsFetchedCount += 1;
+        }
+        const candidateCountAfter = ctx.state.candidates.size;
 
         return {
           companies: companies.map((company) => ({
@@ -439,25 +527,68 @@ Call MULTIPLE TIMES if you need details for more than 25 companies (e.g., for la
             categories: company.categories,
             business_models: company.business_models,
           })),
+          candidateCountBefore,
+          candidateCountAfter,
         };
       },
     }),
 
     finalize_search: tool({
-      description: `Complete the search with ranked results.
-
-PREREQUISITES (must be true before calling):
-1. You MUST have called get_company_details
-2. Results must be homogeneous - all same type of company
-3. For ambiguous queries like "AI coding agents", you MUST have called clarify_with_user first if results are mixed
-
-DO NOT call this if:
-- You haven't called get_company_details yet
-- Results contain BOTH coding assistants AND agent frameworks (must clarify first)
-- You're unsure if results match user intent`,
+      description: "Finalize ranked companies after validation. Must follow active constraints and target count.",
       inputSchema: finalizeSchema,
       execute: async ({ rankedResults, overallConfidence, summary }: z.infer<typeof finalizeSchema>) => {
-        ctx.state.preliminaryResults = rankedResults.map((result) => ({
+        const candidateCountBefore = ctx.state.candidates.size;
+        const uniqueRetrievalQueryCount = new Set(ctx.state.retrievalQueryLog).size;
+        if (ctx.state.companyDetailsFetchedCount <= 0) {
+          return {
+            status: "rejected",
+            message: "Call get_company_details before finalize_search.",
+            resultCount: 0,
+            candidateCountBefore,
+            candidateCountAfter: candidateCountBefore,
+          };
+        }
+
+        if (ctx.state.requireClarificationBeforeFinalize && !ctx.state.clarificationSatisfied) {
+          return {
+            status: "rejected",
+            message: "Clarification required before finalize_search for this query.",
+            resultCount: 0,
+            candidateCountBefore,
+            candidateCountAfter: candidateCountBefore,
+          };
+        }
+
+        if (
+          ctx.state.enforceQueryVariation
+          && !ctx.state.hasHighConfidenceExactMatch
+          && uniqueRetrievalQueryCount < 2
+        ) {
+          return {
+            status: "rejected",
+            message: "Run at least one additional distinct search query variant before finalize_search.",
+            resultCount: 0,
+            candidateCountBefore,
+            candidateCountAfter: candidateCountBefore,
+          };
+        }
+
+        const constrainedResults = rankedResults
+          .filter((result) => applyCompanyIdConstraints([result.companyId], ctx.state).length > 0)
+          .filter((result, index, all) => all.findIndex((entry) => entry.companyId === result.companyId) === index)
+          .slice(0, 50);
+
+        if (!constrainedResults.length) {
+          return {
+            status: "rejected",
+            message: "No results remain after applying request constraints.",
+            resultCount: 0,
+            candidateCountBefore,
+            candidateCountAfter: candidateCountBefore,
+          };
+        }
+
+        ctx.state.preliminaryResults = constrainedResults.map((result) => ({
           companyId: result.companyId,
           confidence: result.confidence,
           reason: result.reason,
@@ -466,9 +597,11 @@ DO NOT call this if:
 
         return {
           status: "finalized",
-          resultCount: rankedResults.length,
+          resultCount: constrainedResults.length,
           overallConfidence,
           summary,
+          candidateCountBefore,
+          candidateCountAfter: ctx.state.candidates.size,
         };
       },
     }),

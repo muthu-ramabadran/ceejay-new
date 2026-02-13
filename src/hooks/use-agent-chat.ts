@@ -159,7 +159,7 @@ export function useAgentChat(options?: UseAgentChatOptions): UseAgentChatResult 
           setActivitySteps([]);
         }
       } finally {
-        if (mountedRef.current && !clarificationPending) {
+        if (mountedRef.current) {
           setIsLoading(false);
         }
       }

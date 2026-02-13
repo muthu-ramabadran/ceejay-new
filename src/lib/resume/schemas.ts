@@ -80,5 +80,6 @@ export type ResumeStreamEvent =
   | { type: "activity"; data: { id: string; label: string; detail: string; status: "running" | "completed" } }
   | { type: "resume_profile"; data: ResumeProfile }
   | { type: "search_progress"; data: { completed: number; total: number; currentQuery: string } }
+  | { type: "heartbeat"; data: { stage: string; elapsedMs: number; pad?: string } }
   | { type: "final_results"; data: { groups: GroupedResults; companiesById: Record<string, unknown> } }
   | { type: "error"; data: { message: string } };

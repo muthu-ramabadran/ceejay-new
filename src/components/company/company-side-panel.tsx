@@ -44,7 +44,7 @@ function TextSection({ title, value }: { title: string; value: string | null }):
   return (
     <section>
       <SectionTitle>{title}</SectionTitle>
-      <p className="text-sm leading-6 text-[var(--text-secondary)]">{value}</p>
+      <p className="text-[15px] leading-7 text-[var(--text-readable)]">{value}</p>
     </section>
   );
 }

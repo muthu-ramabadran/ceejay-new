@@ -2,7 +2,7 @@ import { embedMany, generateObject, generateText, stepCountIs } from "ai";
 import { openai } from "@ai-sdk/openai";
 
 import { getServerEnv } from "@/lib/env";
-import { agentSystemPrompt } from "@/lib/agent/prompts";
+import { agentSystemPrompt, buildAgentRuntimePrompt, type AgentRequestMode } from "@/lib/agent/prompts";
 import { rerankerSchema, type RerankerOutput } from "@/lib/agent/schemas";
 import { createSearchTools, type PreliminaryResult, type SearchAgentState } from "@/lib/agent/tools";
 import { getCompaniesByIds } from "@/lib/search/rpc";
@@ -29,6 +29,10 @@ interface PendingClarification {
   messages: ChatMessage[];
   runId: string;
   startedAtMs: number;
+  runtimePrompt: string;
+  requestMode: AgentRequestMode;
+  targetResultCount: number;
+  previousCandidateIds: string[];
 }
 
 // In-memory store for pending clarifications (in production, use Redis or similar)
@@ -52,7 +56,64 @@ if (typeof setInterval !== "undefined") {
 }
 
 const MAX_STEPS = 15;
-const MAX_RUNTIME_MS = 60_000;
+const MAX_RUNTIME_MS = 240_000;
+const DEFAULT_TARGET_RESULT_COUNT = 15;
+const MAX_TARGET_RESULT_COUNT = 50;
+
+function dedupeCompanyIds(companyIds: string[]): string[] {
+  return Array.from(new Set(companyIds.filter(Boolean)));
+}
+
+function inferRequestMode(userMessage: string, hasPreviousCandidates: boolean): AgentRequestMode {
+  const normalized = userMessage.toLowerCase();
+  const isMoreRequest = /\b(more|additional|another|show more|next page|more results)\b/.test(normalized);
+  const isFilterRequest = /\b(filter|narrow|refine|which of these|from those|from these|among these|only these|only those)\b/.test(normalized);
+  const isSimilarityRequest = /\b(similar|like|alternatives?|competitors?|vs|versus|comparable)\b/.test(normalized);
+
+  if (hasPreviousCandidates && isMoreRequest) {
+    return "more";
+  }
+  if (hasPreviousCandidates && isFilterRequest) {
+    return "filter";
+  }
+  if (isSimilarityRequest) {
+    return "similar";
+  }
+  return "new";
+}
+
+function extractTargetResultCount(userMessage: string, requestMode: AgentRequestMode, previousCount: number): number {
+  const explicitMatch = userMessage.match(/\b(\d{1,3})\s*(?:results?|companies|startups?)\b/i);
+  if (explicitMatch) {
+    const parsed = Number(explicitMatch[1]);
+    if (Number.isFinite(parsed)) {
+      return Math.min(MAX_TARGET_RESULT_COUNT, Math.max(1, parsed));
+    }
+  }
+
+  if (requestMode === "more" && previousCount > 0) {
+    return Math.min(MAX_TARGET_RESULT_COUNT, Math.max(DEFAULT_TARGET_RESULT_COUNT, previousCount));
+  }
+
+  return DEFAULT_TARGET_RESULT_COUNT;
+}
+
+function shouldClarifyBeforeSearch(userMessage: string, requestMode: AgentRequestMode): boolean {
+  if (requestMode === "more" || requestMode === "filter" || requestMode === "similar") {
+    return false;
+  }
+
+  const normalized = userMessage.trim().toLowerCase();
+  const wordCount = normalized.split(/\s+/).filter(Boolean).length;
+  const broadPattern = /\b(ai agents?|ai assistants?|automation tools?|ai companies?|startups?)\b/.test(normalized);
+  const lacksConstraint = !/\b(for|in|with|about|that|where|focused|for developers|for sales|for healthcare|for fintech)\b/.test(normalized);
+
+  return wordCount <= 3 || (broadPattern && lacksConstraint);
+}
+
+function buildAgentSystemMessage(runtimePrompt: string): string {
+  return `${agentSystemPrompt}\n\n${runtimePrompt}`;
+}
 
 const rerankerSystemPrompt = `You are ranking company search candidates for a user query.
 Return strictly valid JSON.
@@ -73,11 +134,13 @@ function buildRerankerPrompt(input: {
   userMessage: string;
   candidates: PreliminaryResult[];
   companyDetails: Company[];
+  targetResultCount: number;
 }): string {
   const companyMap = new Map(input.companyDetails.map((c) => [c.id, c]));
+  const candidateLimit = Math.min(80, Math.max(24, input.targetResultCount * 3));
 
   const candidateBlock = input.candidates
-    .slice(0, 20)
+    .slice(0, candidateLimit)
     .map((candidate) => {
       const company = companyMap.get(candidate.companyId);
       return JSON.stringify({
@@ -96,6 +159,7 @@ function buildRerankerPrompt(input: {
 
   return [
     `User query: ${input.userMessage}`,
+    `Target result count: ${input.targetResultCount}`,
     "",
     "Candidates to rerank:",
     candidateBlock,
@@ -183,7 +247,7 @@ function summarizeToolOutput(toolName: string, result: unknown): Record<string, 
 }
 
 function buildAgentMessages(messages: ChatMessage[]): Array<{ role: "user" | "assistant"; content: string }> {
-  return messages.slice(-6).map((message) => {
+  return messages.slice(-10).map((message) => {
     // For assistant messages, include the company references so agent knows previous results
     if (message.role === "assistant" && message.references && message.references.length > 0) {
       const referenceSummary = message.references
@@ -199,6 +263,63 @@ function buildAgentMessages(messages: ChatMessage[]): Array<{ role: "user" | "as
       content: message.content,
     };
   });
+}
+
+function applyResultConstraints(
+  results: PreliminaryResult[],
+  requestMode: AgentRequestMode,
+  previousCandidateIds: string[],
+  targetResultCount: number
+): PreliminaryResult[] {
+  const previousIdSet = new Set(previousCandidateIds);
+  const seen = new Set<string>();
+  const constrained: PreliminaryResult[] = [];
+
+  for (const result of results) {
+    if (!result.companyId || seen.has(result.companyId)) {
+      continue;
+    }
+    if (requestMode === "more" && previousIdSet.has(result.companyId)) {
+      continue;
+    }
+    if (requestMode === "filter" && previousCandidateIds.length > 0 && !previousIdSet.has(result.companyId)) {
+      continue;
+    }
+    seen.add(result.companyId);
+    constrained.push(result);
+  }
+
+  return constrained.slice(0, Math.min(MAX_TARGET_RESULT_COUNT, Math.max(1, targetResultCount * 2)));
+}
+
+function applyReferenceConstraints(
+  references: FinalAnswerPayload["references"],
+  requestMode: AgentRequestMode,
+  previousCandidateIds: string[],
+  targetResultCount: number
+): FinalAnswerPayload["references"] {
+  const previousIdSet = new Set(previousCandidateIds);
+  const seen = new Set<string>();
+  const constrained: FinalAnswerPayload["references"] = [];
+
+  for (const reference of references) {
+    if (!reference.companyId || seen.has(reference.companyId)) {
+      continue;
+    }
+    if (requestMode === "more" && previousIdSet.has(reference.companyId)) {
+      continue;
+    }
+    if (requestMode === "filter" && previousCandidateIds.length > 0 && !previousIdSet.has(reference.companyId)) {
+      continue;
+    }
+    seen.add(reference.companyId);
+    constrained.push(reference);
+    if (constrained.length >= targetResultCount) {
+      break;
+    }
+  }
+
+  return constrained;
 }
 
 function buildFallbackResponse(message: string): FinalAnswerPayload {
@@ -234,6 +355,17 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
   if (!userMessage) {
     return buildFallbackResponse("No user message found for search.");
   }
+  const previousCandidateIds = dedupeCompanyIds(input.clientContext.previousCandidateIds ?? []);
+  const requestMode = inferRequestMode(userMessage, previousCandidateIds.length > 0);
+  const targetResultCount = extractTargetResultCount(userMessage, requestMode, previousCandidateIds.length);
+  const requiresUpfrontClarification = shouldClarifyBeforeSearch(userMessage, requestMode);
+  const runtimePrompt = buildAgentRuntimePrompt({
+    userMessage,
+    requestMode,
+    targetResultCount,
+    previousCandidateIds,
+    shouldClarifyBeforeSearch: requiresUpfrontClarification,
+  });
 
   // Initialize search run telemetry
   await insertSearchRun(supabase, {
@@ -252,7 +384,16 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
     candidates: new Map(),
     anchorCompany: null,
     toolCallCount: 0,
+    retrievalQueryLog: [],
+    enforceQueryVariation: requestMode === "new" || requestMode === "similar",
+    hasHighConfidenceExactMatch: false,
     preliminaryResults: null,
+    targetResultCount,
+    defaultExcludeCompanyIds: requestMode === "more" ? previousCandidateIds : [],
+    constrainToCompanyIds: requestMode === "filter" && previousCandidateIds.length > 0 ? previousCandidateIds : null,
+    companyDetailsFetchedCount: 0,
+    requireClarificationBeforeFinalize: requiresUpfrontClarification,
+    clarificationSatisfied: !requiresUpfrontClarification,
     clarificationPending: null,
     clarificationResponse: null,
   };
@@ -288,7 +429,7 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
   await input.onActivity?.({
     id: "agent-start",
     label: "Starting search",
-    detail: "Analyzing query and planning search strategy",
+    detail: `Mode: ${requestMode}; target: ${targetResultCount} results`,
     status: "running",
   });
 
@@ -296,7 +437,7 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
     // Phase 1: Agentic search - LLM decides tools based on results
     const agentResult = await generateText({
       model: openai(env.OPENAI_MODEL),
-      system: agentSystemPrompt,
+      system: buildAgentSystemMessage(runtimePrompt),
       messages: buildAgentMessages(input.messages),
       tools,
       stopWhen: stepCountIs(MAX_STEPS),
@@ -318,6 +459,15 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
           // Get the result for this tool call
           const result = toolResultsMap.get(toolCall.toolCallId);
           const outputSummary = result ? summarizeToolOutput(toolCall.toolName, result) : {};
+          const resultRecord = (result ?? {}) as Record<string, unknown>;
+          const candidateCountBefore =
+            typeof resultRecord.candidateCountBefore === "number"
+              ? resultRecord.candidateCountBefore
+              : state.candidates.size;
+          const candidateCountAfter =
+            typeof resultRecord.candidateCountAfter === "number"
+              ? resultRecord.candidateCountAfter
+              : state.candidates.size;
 
           // Log to telemetry
           await insertSearchRunStep(supabase, {
@@ -328,8 +478,8 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
             input_summary: toolCall.input as Record<string, unknown>,
             output_summary: outputSummary,
             duration_ms: 0,
-            candidate_count_before: state.candidates.size,
-            candidate_count_after: state.candidates.size,
+            candidate_count_before: candidateCountBefore,
+            candidate_count_after: candidateCountAfter,
           });
 
           // Emit activity
@@ -349,6 +499,10 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
               messages: input.messages,
               runId,
               startedAtMs,
+              runtimePrompt,
+              requestMode,
+              targetResultCount,
+              previousCandidateIds,
             });
           }
         }
@@ -371,21 +525,23 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
 
     // Check if we got a finalize_search call
     if (!state.preliminaryResults) {
-      // Agent didn't call finalize_search, but we may have candidates - auto-finalize
-      if (state.candidates.size > 0) {
-        console.log(`[agentic-orchestrator] Agent didn't finalize. Auto-finalizing with ${state.candidates.size} candidates.`);
+      if (state.candidates.size > 0 && state.companyDetailsFetchedCount > 0) {
+        console.log(`[agentic-orchestrator] Agent didn't finalize. Applying deterministic fallback with ${state.candidates.size} candidates.`);
 
-        // Sort candidates by combined score and take top 15
-        const sortedCandidates = Array.from(state.candidates.values())
+        const fallbackPreliminary = Array.from(state.candidates.values())
           .sort((a, b) => b.combinedScore - a.combinedScore)
-          .slice(0, 15);
-
-        state.preliminaryResults = sortedCandidates.map((candidate) => ({
+          .map((candidate) => ({
           companyId: candidate.companyId,
           confidence: Math.min(candidate.combinedScore, 1),
           reason: `Matched via ${candidate.matchedFields.join(", ")}`,
           evidenceChips: candidate.matchedTerms.slice(0, 4),
         }));
+        state.preliminaryResults = applyResultConstraints(
+          fallbackPreliminary,
+          requestMode,
+          previousCandidateIds,
+          targetResultCount
+        );
       } else {
         await updateSearchRun(supabase, runId, {
           end_reason: "guardrail_hit",
@@ -394,9 +550,25 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
         });
 
         return buildFallbackResponse(
-          "Could not find relevant companies. Try adding more specific terms or company names."
+          state.companyDetailsFetchedCount === 0
+            ? "Search incomplete: company details were not fetched before finalization. Please retry with a more specific query."
+            : "Could not find relevant companies. Try adding more specific terms or company names."
         );
       }
+    }
+    state.preliminaryResults = applyResultConstraints(
+      state.preliminaryResults,
+      requestMode,
+      previousCandidateIds,
+      targetResultCount
+    );
+    if (!state.preliminaryResults.length) {
+      await updateSearchRun(supabase, runId, {
+        end_reason: "guardrail_hit",
+        tool_call_count: state.toolCallCount,
+        latency_ms: Date.now() - startedAtMs,
+      });
+      return buildFallbackResponse("No candidates satisfy the current request constraints.");
     }
 
     await input.onActivity?.({
@@ -420,6 +592,7 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
         userMessage,
         candidates: state.preliminaryResults,
         companyDetails,
+        targetResultCount,
       }),
     });
 
@@ -434,8 +607,7 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
     const finalCompanyMap = Object.fromEntries(companyDetails.map((c) => [c.id, c]));
     const rerankerData = reranked.object as RerankerOutput;
 
-    const references = rerankerData.rankedCompanyIds
-      .slice(0, 15)
+    const unconstrainedReferences = rerankerData.rankedCompanyIds
       .map((companyId) => {
         const company = finalCompanyMap[companyId];
         const perCompany = rerankerData.perCompany.find((p) => p.companyId === companyId);
@@ -455,10 +627,24 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
         };
       })
       .filter((ref): ref is NonNullable<typeof ref> => ref !== null);
+    const references = applyReferenceConstraints(
+      unconstrainedReferences,
+      requestMode,
+      previousCandidateIds,
+      targetResultCount
+    );
+    if (!references.length) {
+      await updateSearchRun(supabase, runId, {
+        end_reason: "guardrail_hit",
+        tool_call_count: state.toolCallCount,
+        latency_ms: Date.now() - startedAtMs,
+      });
+      return buildFallbackResponse("No companies satisfy the requested constraints.");
+    }
 
     // Generate summary
     const summaryPrompt = `Write a concise 2-3 sentence summary for this company search: "${userMessage}".
-Found ${references.length} companies. Top matches: ${references.slice(0, 3).map((r) => r.companyName).join(", ")}.
+Requested ${targetResultCount} results. Returning ${references.length} companies. Top matches: ${references.slice(0, 3).map((r) => r.companyName).join(", ")}.
 Overall confidence: ${(rerankerData.confidence * 100).toFixed(0)}%. Focus on what was found, not the search process.`;
 
     const summaryResult = await generateText({
@@ -536,10 +722,12 @@ export async function resumeAgentWithClarification(
   // Resume with the clarification response
   const env = getServerEnv();
   const supabase = getSupabaseServerClient();
+  const resumeStartedAtMs = Date.now();
 
   // Update state with the user's selection
   pending.state.clarificationResponse = selection;
   pending.state.clarificationPending = null;
+  pending.state.clarificationSatisfied = true;
 
   let stepCounter = pending.state.toolCallCount;
 
@@ -579,12 +767,12 @@ export async function resumeAgentWithClarification(
     // Continue the agentic search
     await generateText({
       model: openai(env.OPENAI_MODEL),
-      system: agentSystemPrompt,
+      system: buildAgentSystemMessage(pending.runtimePrompt),
       messages: resumeMessages,
       tools,
       stopWhen: stepCountIs(MAX_STEPS - pending.state.toolCallCount),
       onStepFinish: async (step) => {
-        if (Date.now() - pending.startedAtMs > MAX_RUNTIME_MS) {
+        if (Date.now() - resumeStartedAtMs > MAX_RUNTIME_MS) {
           throw new Error("Search timeout exceeded");
         }
 
@@ -600,6 +788,15 @@ export async function resumeAgentWithClarification(
           // Get the result for this tool call
           const result = toolResultsMap.get(toolCall.toolCallId);
           const outputSummary = result ? summarizeToolOutput(toolCall.toolName, result) : {};
+          const resultRecord = (result ?? {}) as Record<string, unknown>;
+          const candidateCountBefore =
+            typeof resultRecord.candidateCountBefore === "number"
+              ? resultRecord.candidateCountBefore
+              : pending.state.candidates.size;
+          const candidateCountAfter =
+            typeof resultRecord.candidateCountAfter === "number"
+              ? resultRecord.candidateCountAfter
+              : pending.state.candidates.size;
 
           await insertSearchRunStep(supabase, {
             run_id: pending.runId,
@@ -609,8 +806,8 @@ export async function resumeAgentWithClarification(
             input_summary: toolCall.input as Record<string, unknown>,
             output_summary: outputSummary,
             duration_ms: 0,
-            candidate_count_before: pending.state.candidates.size,
-            candidate_count_after: pending.state.candidates.size,
+            candidate_count_before: candidateCountBefore,
+            candidate_count_after: candidateCountAfter,
           });
 
           await input.onActivity?.({
@@ -624,20 +821,23 @@ export async function resumeAgentWithClarification(
     });
 
     if (!pending.state.preliminaryResults) {
-      // Agent didn't call finalize_search, but we may have candidates - auto-finalize
-      if (pending.state.candidates.size > 0) {
-        console.log(`[agentic-orchestrator] Agent didn't finalize after resume. Auto-finalizing with ${pending.state.candidates.size} candidates.`);
+      if (pending.state.candidates.size > 0 && pending.state.companyDetailsFetchedCount > 0) {
+        console.log(`[agentic-orchestrator] Agent didn't finalize after resume. Applying deterministic fallback with ${pending.state.candidates.size} candidates.`);
 
-        const sortedCandidates = Array.from(pending.state.candidates.values())
+        const fallbackPreliminary = Array.from(pending.state.candidates.values())
           .sort((a, b) => b.combinedScore - a.combinedScore)
-          .slice(0, 15);
-
-        pending.state.preliminaryResults = sortedCandidates.map((candidate) => ({
+          .map((candidate) => ({
           companyId: candidate.companyId,
           confidence: Math.min(candidate.combinedScore, 1),
           reason: `Matched via ${candidate.matchedFields.join(", ")}`,
           evidenceChips: candidate.matchedTerms.slice(0, 4),
         }));
+        pending.state.preliminaryResults = applyResultConstraints(
+          fallbackPreliminary,
+          pending.requestMode,
+          pending.previousCandidateIds,
+          pending.targetResultCount
+        );
       } else {
         await updateSearchRun(supabase, pending.runId, {
           end_reason: "guardrail_hit",
@@ -649,6 +849,20 @@ export async function resumeAgentWithClarification(
           "Could not find relevant companies after clarification. Try a different search."
         );
       }
+    }
+    pending.state.preliminaryResults = applyResultConstraints(
+      pending.state.preliminaryResults,
+      pending.requestMode,
+      pending.previousCandidateIds,
+      pending.targetResultCount
+    );
+    if (!pending.state.preliminaryResults.length) {
+      await updateSearchRun(supabase, pending.runId, {
+        end_reason: "guardrail_hit",
+        tool_call_count: pending.state.toolCallCount,
+        latency_ms: Date.now() - pending.startedAtMs,
+      });
+      return buildFallbackResponse("No candidates satisfy the current request constraints.");
     }
 
     await input.onActivity?.({
@@ -674,6 +888,7 @@ export async function resumeAgentWithClarification(
         userMessage: `${userMessage} (User clarified: ${selection})`,
         candidates: pending.state.preliminaryResults,
         companyDetails,
+        targetResultCount: pending.targetResultCount,
       }),
     });
 
@@ -687,8 +902,7 @@ export async function resumeAgentWithClarification(
     const finalCompanyMap = Object.fromEntries(companyDetails.map((c) => [c.id, c]));
     const rerankerData = reranked.object as RerankerOutput;
 
-    const references = rerankerData.rankedCompanyIds
-      .slice(0, 15)
+    const unconstrainedReferences = rerankerData.rankedCompanyIds
       .map((companyId) => {
         const company = finalCompanyMap[companyId];
         const perCompany = rerankerData.perCompany.find((p) => p.companyId === companyId);
@@ -707,9 +921,23 @@ export async function resumeAgentWithClarification(
         };
       })
       .filter((ref): ref is NonNullable<typeof ref> => ref !== null);
+    const references = applyReferenceConstraints(
+      unconstrainedReferences,
+      pending.requestMode,
+      pending.previousCandidateIds,
+      pending.targetResultCount
+    );
+    if (!references.length) {
+      await updateSearchRun(supabase, pending.runId, {
+        end_reason: "guardrail_hit",
+        tool_call_count: pending.state.toolCallCount,
+        latency_ms: Date.now() - pending.startedAtMs,
+      });
+      return buildFallbackResponse("No companies satisfy the requested constraints.");
+    }
 
     const summaryPrompt = `Write a concise 2-3 sentence summary for this company search: "${userMessage}" (clarified as: ${selection}).
-Found ${references.length} companies. Top matches: ${references.slice(0, 3).map((r) => r.companyName).join(", ")}.
+Requested ${pending.targetResultCount} results. Returning ${references.length} companies. Top matches: ${references.slice(0, 3).map((r) => r.companyName).join(", ")}.
 Overall confidence: ${(rerankerData.confidence * 100).toFixed(0)}%. Focus on what was found.`;
 
     const summaryResult = await generateText({

@@ -107,7 +107,9 @@ export async function executeSearchPlan(
       })
     );
 
-    for (const settled of batchResults) {
+    for (let idx = 0; idx < batchResults.length; idx += 1) {
+      const settled = batchResults[idx];
+      const query = batch[idx]?.query ?? "";
       completed++;
       if (settled.status === "fulfilled") {
         const { rows, source, isAdjacent } = settled.value;
@@ -125,8 +127,10 @@ export async function executeSearchPlan(
             });
           }
         }
+        onProgress?.(completed, totalSearches, source);
+      } else {
+        onProgress?.(completed, totalSearches, query);
       }
-      onProgress?.(completed, totalSearches, batch[0]?.query ?? "");
     }
   }
 
@@ -160,6 +164,122 @@ export async function executeSearchPlan(
   return { results, adjacentIds };
 }
 
+const RESUME_GROUPING_TARGET_COUNT = 100;
+const RESUME_GROUPING_POOL_LIMIT = 140;
+
+function normalizeGroupedResults(input: {
+  grouped: GroupedResults;
+  orderedCompanyIds: string[];
+  adjacentIds: Set<string>;
+  targetCount: number;
+}): GroupedResults {
+  const availableIds = new Set(input.orderedCompanyIds);
+  const usedIds = new Set<string>();
+  const reasonById = new Map<string, string>();
+
+  for (const group of input.grouped.groups) {
+    for (const reason of group.companyReasons) {
+      if (!reasonById.has(reason.companyId) && reason.reason.trim()) {
+        reasonById.set(reason.companyId, reason.reason.trim());
+      }
+    }
+  }
+  for (const reason of input.grouped.feelingLucky.companyReasons) {
+    if (!reasonById.has(reason.companyId) && reason.reason.trim()) {
+      reasonById.set(reason.companyId, reason.reason.trim());
+    }
+  }
+
+  const defaultReason = "Strong match based on your domain experience and role-relevant problem space.";
+  const normalizeIds = (ids: string[]): string[] => {
+    const deduped: string[] = [];
+    for (const id of ids) {
+      if (!availableIds.has(id) || usedIds.has(id)) {
+        continue;
+      }
+      usedIds.add(id);
+      deduped.push(id);
+    }
+    return deduped;
+  };
+
+  const normalizedGroups: GroupedResults["groups"] = [];
+  for (const group of input.grouped.groups) {
+    const ids = normalizeIds(group.companyIds);
+    if (!ids.length) continue;
+    normalizedGroups.push({
+      title: group.title,
+      description: group.description,
+      companyIds: ids,
+      companyReasons: ids.map((companyId) => ({
+        companyId,
+        reason: reasonById.get(companyId) ?? defaultReason,
+      })),
+    });
+  }
+
+  let luckyIds = normalizeIds(input.grouped.feelingLucky.companyIds);
+
+  const desiredTotal = Math.min(input.targetCount, input.orderedCompanyIds.length);
+  const currentTotal = normalizedGroups.reduce((sum, group) => sum + group.companyIds.length, 0) + luckyIds.length;
+
+  if (currentTotal < desiredTotal) {
+    const fillIds = input.orderedCompanyIds
+      .filter((id) => !usedIds.has(id))
+      .slice(0, desiredTotal - currentTotal);
+
+    const primaryFill = fillIds.filter((id) => !input.adjacentIds.has(id));
+    const luckyFill = fillIds.filter((id) => input.adjacentIds.has(id));
+
+    if (primaryFill.length > 0) {
+      for (const id of primaryFill) usedIds.add(id);
+      normalizedGroups.push({
+        title: "Additional Strong Matches",
+        description: "Additional high-relevance matches based on your profile and search ranking.",
+        companyIds: primaryFill,
+        companyReasons: primaryFill.map((companyId) => ({
+          companyId,
+          reason: reasonById.get(companyId) ?? defaultReason,
+        })),
+      });
+    }
+
+    if (luckyFill.length > 0) {
+      for (const id of luckyFill) usedIds.add(id);
+      luckyIds = [...luckyIds, ...luckyFill];
+    }
+  }
+
+  if (!normalizedGroups.length && input.orderedCompanyIds.length) {
+    const fallbackIds = input.orderedCompanyIds.slice(0, Math.min(desiredTotal || 20, input.orderedCompanyIds.length));
+    normalizedGroups.push({
+      title: "Top Matches",
+      description: "Highest ranked companies matching your resume profile.",
+      companyIds: fallbackIds,
+      companyReasons: fallbackIds.map((companyId) => ({
+        companyId,
+        reason: reasonById.get(companyId) ?? defaultReason,
+      })),
+    });
+    luckyIds = luckyIds.filter((id) => !fallbackIds.includes(id));
+  }
+
+  return {
+    groups: normalizedGroups,
+    feelingLucky: {
+      title: input.grouped.feelingLucky.title || "Feeling Lucky",
+      description:
+        input.grouped.feelingLucky.description ||
+        "Interesting adjacent opportunities related to your experience.",
+      companyIds: luckyIds,
+      companyReasons: luckyIds.map((companyId) => ({
+        companyId,
+        reason: reasonById.get(companyId) ?? defaultReason,
+      })),
+    },
+  };
+}
+
 export async function fetchAndGroupResults(
   results: Map<string, SearchResult>,
   adjacentIds: Set<string>,
@@ -168,18 +288,25 @@ export async function fetchAndGroupResults(
   const env = getServerEnv();
   const supabase = getSupabaseServerClient();
 
-  // Fetch all unique company details
-  const allIds = Array.from(results.keys());
+  // Keep a broad but bounded candidate pool for grouping quality and prompt size.
+  const rankedIds = Array.from(results.values())
+    .sort((a, b) => b.score - a.score)
+    .map((r) => r.companyId);
+  const selectedIds = rankedIds.slice(0, Math.min(RESUME_GROUPING_POOL_LIMIT, rankedIds.length));
   const companies: Company[] = [];
 
   // Fetch in batches of 50
-  for (let i = 0; i < allIds.length; i += 50) {
-    const batch = allIds.slice(i, i + 50);
+  for (let i = 0; i < selectedIds.length; i += 50) {
+    const batch = selectedIds.slice(i, i + 50);
     const fetched = await getCompaniesByIds(supabase, batch);
     companies.push(...fetched);
   }
 
-  const companiesById = Object.fromEntries(companies.map((c) => [c.id, c]));
+  const fetchedById = new Map(companies.map((c) => [c.id, c]));
+  const orderedCompanies = selectedIds
+    .map((id) => fetchedById.get(id))
+    .filter((company): company is Company => Boolean(company));
+  const companiesById = Object.fromEntries(orderedCompanies.map((c) => [c.id, c]));
 
   const profileSummary = [
     `Summary: ${profile.summary}`,
@@ -188,19 +315,30 @@ export async function fetchAndGroupResults(
     `Problem spaces: ${profile.problemSpaces.join(", ")}`,
   ].join("\n");
 
-  const companyList = companies.map((c) => ({
+  const companyList = orderedCompanies.map((c) => ({
     id: c.id,
     name: c.company_name,
     description: c.description,
     sectors: c.sectors,
     categories: c.categories,
   }));
+  const adjacentInPool = new Set(
+    Array.from(adjacentIds).filter((companyId) => Boolean(companiesById[companyId]))
+  );
+  const groupingTargetCount = Math.min(RESUME_GROUPING_TARGET_COUNT, orderedCompanies.length);
 
   const result = await generateObject({
     model: openai(env.OPENAI_MODEL),
     schema: groupedResultsSchema,
-    prompt: buildGroupingPrompt(profileSummary, companyList, adjacentIds),
+    prompt: buildGroupingPrompt(profileSummary, companyList, adjacentInPool, groupingTargetCount),
   });
 
-  return { grouped: result.object, companiesById };
+  const normalizedGrouped = normalizeGroupedResults({
+    grouped: result.object,
+    orderedCompanyIds: selectedIds.filter((companyId) => Boolean(companiesById[companyId])),
+    adjacentIds: adjacentInPool,
+    targetCount: groupingTargetCount,
+  });
+
+  return { grouped: normalizedGrouped, companiesById };
 }

@@ -71,12 +71,13 @@ For taxonomy searches, use exact sector/category names from this list:
 export function buildGroupingPrompt(
   profileSummary: string,
   companies: Array<{ id: string; name: string; description: string | null; sectors: string[]; categories: string[] }>,
-  adjacentCompanyIds: Set<string>
+  adjacentCompanyIds: Set<string>,
+  targetCount: number,
 ): string {
   const companyList = companies
     .map(
       (c) =>
-        `- ${c.id}: ${c.name} — ${c.description?.slice(0, 150) ?? "No description"} [${c.sectors.join(", ")}]`
+        `- ${c.id}: ${c.name} — ${c.description?.slice(0, 110) ?? "No description"} [${c.sectors.join(", ")}]`
     )
     .join("\n");
 
@@ -95,7 +96,7 @@ IDs: ${adjacentList || "none"}
 
 ## Instructions
 
-1. Create 3-8 themed groups based on the candidate's experience areas. Each group should have a clear theme tied to their expertise.
+1. Create 4-10 themed groups based on the candidate's experience areas. Each group should have a clear theme tied to their expertise.
    - title: Short label like "Lending & Credit Platforms" or "Developer Infrastructure"
    - description: 1 sentence explaining why this group matches the candidate
    - companyIds: Array of company IDs that belong in this group
@@ -108,7 +109,8 @@ IDs: ${adjacentList || "none"}
 
 Rules:
 - Every company must appear in exactly ONE group (or Feeling Lucky)
-- Groups should have at least 3 companies each. Merge small groups.
+- Aim to cover around ${targetCount} companies total (or all companies if fewer are available).
+- Groups should usually have 6-20 companies each. Merge tiny groups.
 - Order groups by relevance to the candidate's strongest experience areas
-- The Feeling Lucky section should have 3-8 companies`;
+- The Feeling Lucky section should have 8-20 companies when enough adjacent candidates exist`;
 }

@@ -11,7 +11,7 @@ import { CompanySidePanel } from "@/components/company/company-side-panel";
 import { Badge } from "@/components/ui/badge";
 import { useResumeMatch, type ActivityStep } from "@/hooks/use-resume-match";
 
-function ActivityTimeline({ steps, searchProgress }: { steps: ActivityStep[]; searchProgress: { completed: number; total: number; currentQuery: string } | null }): React.JSX.Element {
+function ActivityTimeline({ steps, searchProgress }: { steps: ActivityStep[]; searchProgress: { completed: number; total: number; currentQuery: string; recentQueries: string[] } | null }): React.JSX.Element {
   return (
     <div className="mx-auto max-w-md space-y-2">
       {steps.map((step) => (
@@ -38,6 +38,18 @@ function ActivityTimeline({ steps, searchProgress }: { steps: ActivityStep[]; se
           <p className="mt-1 text-xs text-[var(--text-tertiary)]">
             {searchProgress.completed}/{searchProgress.total} searches
           </p>
+          {searchProgress.recentQueries.length > 0 ? (
+            <div className="mt-2 space-y-1">
+              <p className="text-[10px] font-semibold uppercase tracking-[0.5px] text-[var(--text-tertiary)]">
+                Recent Queries
+              </p>
+              {searchProgress.recentQueries.map((query) => (
+                <p key={query} className="truncate text-xs text-[var(--text-secondary)]">
+                  {query}
+                </p>
+              ))}
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>

@@ -18,6 +18,7 @@ export interface SearchProgress {
   completed: number;
   total: number;
   currentQuery: string;
+  recentQueries: string[];
 }
 
 export interface UseResumeMatchResult {
@@ -34,6 +35,9 @@ export interface UseResumeMatchResult {
 }
 
 export function useResumeMatch(): UseResumeMatchResult {
+  const RESPONSE_START_TIMEOUT_MS = 120_000;
+  const STREAM_IDLE_TIMEOUT_MS = 600_000;
+
   const [phase, setPhase] = useState<ResumeMatchPhase>("upload");
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -59,76 +63,138 @@ export function useResumeMatch(): UseResumeMatchResult {
     });
   }, []);
 
+  const withTimeout = useCallback(async <T,>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(message));
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
+  }, []);
+
   const uploadResume = useCallback(async (file: File) => {
     setPhase("processing");
     setIsProcessing(true);
     setError(null);
-    setActivitySteps([]);
+    setActivitySteps([{
+      id: "upload",
+      label: "Uploading resume",
+      detail: file.name,
+      status: "running",
+    }]);
     setSearchProgress(null);
     setProfile(null);
     setGroupedResults(null);
     setCompaniesById({});
+    const abortController = new AbortController();
 
     try {
       const formData = new FormData();
       formData.append("resume", file);
-
-      const response = await fetch("/api/resume", {
-        method: "POST",
-        body: formData,
-      });
+      const response = await withTimeout(
+        fetch("/api/resume", {
+          method: "POST",
+          body: formData,
+          signal: abortController.signal,
+        }),
+        RESPONSE_START_TIMEOUT_MS,
+        `Upload timed out waiting for server response after ${Math.round(RESPONSE_START_TIMEOUT_MS / 1000)}s.`
+      );
 
       if (!response.ok || !response.body) {
         const errBody = await response.json().catch(() => ({ error: "Upload failed" }));
         throw new Error(errBody.error ?? `Upload failed (${response.status})`);
       }
+      updateActivity({
+        id: "upload",
+        label: "Uploading resume",
+        detail: file.name,
+        status: "completed",
+      });
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      const processLine = (line: string) => {
+        const raw = line.trim();
+        if (!raw) return;
+
+        const event = JSON.parse(raw) as ResumeStreamEvent;
+
+        if (!mountedRef.current) return;
+
+        if (event.type === "activity") {
+          updateActivity(event.data);
+        }
+
+        if (event.type === "resume_profile") {
+          setProfile(event.data);
+        }
+
+        if (event.type === "search_progress") {
+          setSearchProgress((prev) => {
+            const query = event.data.currentQuery.trim();
+            const recent = query
+              ? [query, ...(prev?.recentQueries ?? []).filter((q) => q !== query)].slice(0, 6)
+              : (prev?.recentQueries ?? []);
+
+            return {
+              ...event.data,
+              recentQueries: recent,
+            };
+          });
+        }
+
+        if (event.type === "final_results") {
+          setGroupedResults(event.data.groups);
+          setCompaniesById(event.data.companiesById as Record<string, Company>);
+          setPhase("results");
+        }
+
+        if (event.type === "error") {
+          throw new Error(event.data.message);
+        }
+      };
 
       while (true) {
-        const { done, value: chunk } = await reader.read();
-        if (done) break;
+        const { done, value: chunk } = await withTimeout(
+          reader.read(),
+          STREAM_IDLE_TIMEOUT_MS,
+          "Resume processing timed out due to no progress updates."
+        );
+        if (done) {
+          break;
+        }
 
         buffer += decoder.decode(chunk, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() ?? "";
 
         for (const line of lines) {
-          const raw = line.trim();
-          if (!raw) continue;
-
-          const event = JSON.parse(raw) as ResumeStreamEvent;
-
-          if (!mountedRef.current) return;
-
-          if (event.type === "activity") {
-            updateActivity(event.data);
-          }
-
-          if (event.type === "resume_profile") {
-            setProfile(event.data);
-          }
-
-          if (event.type === "search_progress") {
-            setSearchProgress(event.data);
-          }
-
-          if (event.type === "final_results") {
-            setGroupedResults(event.data.groups);
-            setCompaniesById(event.data.companiesById as Record<string, Company>);
-            setPhase("results");
-          }
-
-          if (event.type === "error") {
-            throw new Error(event.data.message);
-          }
+          processLine(line);
         }
       }
+      const trailing = buffer.trim();
+      if (trailing) {
+        processLine(trailing);
+      }
     } catch (err) {
+      abortController.abort();
       if (mountedRef.current) {
-        const message = err instanceof Error ? err.message : "Resume processing failed";
+        const message =
+          err instanceof Error
+            ? err.message
+            : "Resume processing failed";
         setError(message);
         setPhase("upload");
       }
@@ -137,7 +203,7 @@ export function useResumeMatch(): UseResumeMatchResult {
         setIsProcessing(false);
       }
     }
-  }, [updateActivity]);
+  }, [updateActivity, withTimeout]);
 
   const reset = useCallback(() => {
     setPhase("upload");

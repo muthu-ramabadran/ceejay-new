@@ -22,11 +22,11 @@ export function MessageBubble({ message, onOpenReference }: MessageBubbleProps):
           <p className="section-header">Matches</p>
           <ul className="space-y-2">
             {message.references.map((reference) => (
-              <li key={reference.companyId} className="text-sm leading-6 text-[var(--text-secondary)]">
+              <li key={reference.companyId} className="text-[14px] leading-6 text-[var(--text-readable)]">
                 <span>{reference.inlineDescription ?? reference.reason}</span>{" "}
                 <ReferenceChip reference={reference} onOpen={onOpenReference} />
                 {reference.evidenceChips?.length ? (
-                  <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-[var(--text-tertiary)]">
+                  <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-[var(--text-secondary)]">
                     {reference.evidenceChips.map((chip) => (
                       <span key={`${reference.companyId}-${chip}`} className="rounded-full border border-border/60 px-2 py-0.5">
                         {chip}
