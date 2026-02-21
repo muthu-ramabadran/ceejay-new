@@ -60,6 +60,34 @@ const MAX_STEPS = 15;
 const MAX_RUNTIME_MS = 240_000;
 const DEFAULT_TARGET_RESULT_COUNT = 15;
 const MAX_TARGET_RESULT_COUNT = 50;
+const NUMBER_WORDS: Record<string, number> = {
+  a: 1,
+  an: 1,
+  single: 1,
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+  eleven: 11,
+  twelve: 12,
+  thirteen: 13,
+  fourteen: 14,
+  fifteen: 15,
+  sixteen: 16,
+  seventeen: 17,
+  eighteen: 18,
+  nineteen: 19,
+  twenty: 20,
+  thirty: 30,
+  forty: 40,
+  fifty: 50,
+};
 
 function dedupeCompanyIds(companyIds: string[]): string[] {
   return Array.from(new Set(companyIds.filter(Boolean)));
@@ -83,17 +111,53 @@ function inferRequestMode(userMessage: string, hasPreviousCandidates: boolean): 
   return "new";
 }
 
+function clampResultCount(value: number): number {
+  return Math.min(MAX_TARGET_RESULT_COUNT, Math.max(1, value));
+}
+
+function parseCountToken(token: string): number | null {
+  const trimmed = token.trim().toLowerCase();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (/^\d{1,3}$/.test(trimmed)) {
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? clampResultCount(parsed) : null;
+  }
+
+  const normalized = trimmed.replace(/-/g, " ").replace(/\s+/g, " ");
+  if (NUMBER_WORDS[normalized]) {
+    return clampResultCount(NUMBER_WORDS[normalized]);
+  }
+
+  const parts = normalized.split(" ");
+  if (parts.length === 2 && NUMBER_WORDS[parts[0]] && NUMBER_WORDS[parts[1]]) {
+    const combined = NUMBER_WORDS[parts[0]] + NUMBER_WORDS[parts[1]];
+    return clampResultCount(combined);
+  }
+
+  return null;
+}
+
 function extractTargetResultCount(userMessage: string, requestMode: AgentRequestMode, previousCount: number): number {
-  const explicitMatch = userMessage.match(/\b(\d{1,3})\s*(?:results?|companies|startups?)\b/i);
-  if (explicitMatch) {
-    const parsed = Number(explicitMatch[1]);
-    if (Number.isFinite(parsed)) {
-      return Math.min(MAX_TARGET_RESULT_COUNT, Math.max(1, parsed));
+  const explicitCountWithEntity = userMessage.match(
+    /\b(?:only|just|exactly|around|about|roughly|up to|at most|at least|top|show|find|give|list|return|want)?\s*((?:\d{1,3}|[a-z]+(?:[-\s][a-z]+)?))\s+(?:results?|companies|startups?)\b/i
+  );
+  if (explicitCountWithEntity?.[1]) {
+    const parsed = parseCountToken(explicitCountWithEntity[1]);
+    if (parsed !== null) {
+      return parsed;
     }
   }
 
+  const singularEntityIntent = userMessage.match(/\b(?:only|just|exactly)?\s*(?:a|an|single)\s+(?:result|company|startup)\b/i);
+  if (singularEntityIntent) {
+    return 1;
+  }
+
   if (requestMode === "more" && previousCount > 0) {
-    return Math.min(MAX_TARGET_RESULT_COUNT, Math.max(DEFAULT_TARGET_RESULT_COUNT, previousCount));
+    return clampResultCount(Math.max(DEFAULT_TARGET_RESULT_COUNT, previousCount));
   }
 
   return DEFAULT_TARGET_RESULT_COUNT;
@@ -708,7 +772,7 @@ export async function resumeAgentWithClarification(
   sessionId: string,
   selection: string,
   input: AgentOrchestratorInput
-): Promise<FinalAnswerPayload> {
+): Promise<FinalAnswerPayload | null> {
   const pending = pendingClarifications.get(sessionId);
 
   if (!pending) {
@@ -729,8 +793,18 @@ export async function resumeAgentWithClarification(
   pending.state.clarificationResponse = selection;
   pending.state.clarificationPending = null;
   pending.state.clarificationSatisfied = true;
+  const clarifiedMessages: ChatMessage[] = [
+    ...pending.messages,
+    {
+      id: `clarification-${Date.now()}`,
+      role: "assistant",
+      content: `User clarification provided: "${selection}"`,
+      createdAt: new Date().toISOString(),
+    },
+  ];
 
   let stepCounter = pending.state.toolCallCount;
+  let clarificationRequested = false;
 
   const tools = createSearchTools({
     supabase,
@@ -743,8 +817,11 @@ export async function resumeAgentWithClarification(
     },
     state: pending.state,
     onActivity: input.onActivity,
-    onClarificationRequest: () => {
-      // Note: nested clarification not currently supported in resume flow
+    onClarificationRequest: (data) => {
+      clarificationRequested = true;
+      if (input.onClarificationRequest) {
+        input.onClarificationRequest(data);
+      }
     },
   });
 
@@ -758,7 +835,7 @@ export async function resumeAgentWithClarification(
   try {
     // Build messages with the clarification context
     const resumeMessages = [
-      ...buildAgentMessages(pending.messages),
+      ...buildAgentMessages(clarifiedMessages),
       {
         role: "user" as const,
         content: `The user clarified their intent: "${selection}". Continue the search with this understanding.`,
@@ -817,9 +894,40 @@ export async function resumeAgentWithClarification(
             detail: formatToolDetail(toolCall.toolName, toolCall.input),
             status: "completed",
           });
+
+          if (toolCall.toolName === "clarify_with_user" && pending.state.clarificationPending) {
+            pendingClarifications.set(sessionId, {
+              sessionId,
+              state: pending.state,
+              messages: clarifiedMessages,
+              runId: pending.runId,
+              startedAtMs: pending.startedAtMs,
+              runtimePrompt: pending.runtimePrompt,
+              requestMode: pending.requestMode,
+              targetResultCount: pending.targetResultCount,
+              previousCandidateIds: pending.previousCandidateIds,
+            });
+          }
         }
       },
     });
+
+    if (clarificationRequested && pending.state.clarificationPending) {
+      if (!pendingClarifications.has(sessionId)) {
+        pendingClarifications.set(sessionId, {
+          sessionId,
+          state: pending.state,
+          messages: clarifiedMessages,
+          runId: pending.runId,
+          startedAtMs: pending.startedAtMs,
+          runtimePrompt: pending.runtimePrompt,
+          requestMode: pending.requestMode,
+          targetResultCount: pending.targetResultCount,
+          previousCandidateIds: pending.previousCandidateIds,
+        });
+      }
+      return null;
+    }
 
     if (!pending.state.preliminaryResults) {
       if (pending.state.candidates.size > 0 && pending.state.companyDetailsFetchedCount > 0) {
@@ -879,7 +987,7 @@ export async function resumeAgentWithClarification(
       pending.state.preliminaryResults.map((r) => r.companyId)
     );
 
-    const userMessage = pending.messages.filter((m) => m.role === "user").at(-1)?.content?.trim() ?? "";
+    const userMessage = clarifiedMessages.filter((m) => m.role === "user").at(-1)?.content?.trim() ?? "";
 
     const reranked = await generateObject({
       model: openai(env.OPENAI_MODEL),

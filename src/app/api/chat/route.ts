@@ -33,6 +33,7 @@ export async function POST(request: Request): Promise<Response> {
 
   // Handle clarification response (resume agent)
   if (isClarificationResponse(body)) {
+    let clarificationData: ClarificationRequestData | null = null;
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         try {
@@ -49,8 +50,28 @@ export async function POST(request: Request): Promise<Response> {
               onPartialText: async (text) => {
                 controller.enqueue(encodeEvent({ type: "partial_text", data: { text } }));
               },
+              onClarificationRequest: (data) => {
+                clarificationData = data;
+              },
             }
           );
+
+          if (result === null && clarificationData) {
+            controller.enqueue(
+              encodeEvent({
+                type: "clarification_request",
+                data: clarificationData,
+              })
+            );
+            controller.close();
+            return;
+          }
+
+          if (!result) {
+            controller.enqueue(encodeEvent({ type: "error", data: { message: SEARCH_UNAVAILABLE_MESSAGE } }));
+            controller.close();
+            return;
+          }
 
           controller.enqueue(
             encodeEvent({

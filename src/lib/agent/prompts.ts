@@ -19,7 +19,11 @@ Rules:
 4. For ambiguous queries:
 - Clarify immediately if the user query is clearly underspecified.
 - Otherwise run a quick probe (search + details). If top candidates split across multiple plausible intents, call clarify_with_user.
+ - Ask one concrete missing-constraint question at a time (domain/use case/customer/stage/geography), not abstract ranking dimensions.
+ - Clarification options must describe specific intents (for example "B2B fintech tools for SMB accounting teams"), never options like "sector-based" or "product-focused".
+ - Always include an option that lets the user type their own specific criteria.
 5. finalize_search should contain only companies that satisfy the active request constraints and should match the requested result count as closely as possible.
+ - If the target result count is 1, return exactly 1 company unless zero matches satisfy constraints.
 6. Prefer high precision over broad recall. Use niches/product/problem/target_customer evidence, not keyword overlap alone.
 7. If no strong matches exist, return a short ranked list with low confidence rather than inventing relevance.
 
@@ -31,7 +35,7 @@ Tooling expectations:
 - search_keyword: exact terminology disambiguation
 - search_taxonomy: strict sector/category/model filters
 - get_company_details: mandatory validation before finalize_search
-- clarify_with_user: use only when intent cannot be resolved confidently
+- clarify_with_user: use only when intent cannot be resolved confidently; each option must include a concrete selection text you can search with
 - finalize_search: structured handoff of ranked results`;
 
 export function buildAgentRuntimePrompt(input: AgentRuntimePromptInput): string {
@@ -74,6 +78,7 @@ export function buildAgentRuntimePrompt(input: AgentRuntimePromptInput): string 
     `- Previous candidate IDs: ${previousIdsText}`,
     ...modeRules[input.requestMode].map((rule) => `- ${rule}`),
     `- ${clarificationRule}`,
+    `- Do not return more than ${input.targetResultCount} final results.`,
     "- Finalize with high-precision matches only and keep evidence concise.",
   ].join("\n");
 }

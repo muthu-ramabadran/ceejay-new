@@ -38,6 +38,7 @@ export interface AgentActivityEventPayload {
 export interface ClarificationOption {
   label: string;
   description: string;
+  selection: string;
 }
 
 export interface ClarificationRequestData {

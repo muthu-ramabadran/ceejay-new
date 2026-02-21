@@ -237,11 +237,16 @@ const clarifySchema = z.object({
       z.object({
         label: z.string(),
         description: z.string(),
+        selection: z
+          .string()
+          .min(4)
+          .max(220)
+          .describe("Concrete intent text to use when this option is selected."),
       })
     )
     .min(2)
     .max(4)
-    .describe("2-4 options to clarify intent"),
+    .describe("2-4 concrete options to clarify intent (never abstract modes)"),
 });
 
 const companyDetailsSchema = z.object({

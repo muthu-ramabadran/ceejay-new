@@ -8,10 +8,15 @@ import { cn } from "@/lib/utils";
 
 interface ChatComposerProps {
   disabled?: boolean;
+  placeholder?: string;
   onSubmit: (value: string) => Promise<void>;
 }
 
-export function ChatComposer({ disabled = false, onSubmit }: ChatComposerProps): React.JSX.Element {
+export function ChatComposer({
+  disabled = false,
+  placeholder = "Ask for startups by niche, for example: companies focused on AI healthcare",
+  onSubmit,
+}: ChatComposerProps): React.JSX.Element {
   const [value, setValue] = useState("");
 
   async function handleSubmit(): Promise<void> {
@@ -43,7 +48,7 @@ export function ChatComposer({ disabled = false, onSubmit }: ChatComposerProps):
             void handleSubmit();
           }
         }}
-        placeholder="Ask for startups by niche, for example: companies focused on AI healthcare"
+        placeholder={placeholder}
         className={cn(
           "min-h-[86px] w-full resize-none bg-transparent text-[15px] text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] focus:outline-none",
           disabled ? "cursor-not-allowed opacity-70" : "",

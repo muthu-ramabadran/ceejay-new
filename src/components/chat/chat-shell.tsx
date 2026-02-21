@@ -96,6 +96,10 @@ export function ChatShell(): React.JSX.Element {
     setSelectedCompanyId(null);
   }
 
+  const composerPlaceholder = clarificationPending
+    ? "Add specific constraints (for example: B2B fintech, seed to Series A, remote-friendly)"
+    : "Ask for startups by niche, for example: companies focused on AI healthcare";
+
   return (
     <div className="flex h-screen flex-col">
       <header className="flex h-14 shrink-0 items-center justify-between border-b border-border/60 px-7">
@@ -146,7 +150,11 @@ export function ChatShell(): React.JSX.Element {
             />
           ) : null}
 
-          <ChatComposer onSubmit={sendMessage} disabled={isLoading || clarificationPending !== null} />
+          <ChatComposer
+            onSubmit={clarificationPending ? handleClarificationResponse : sendMessage}
+            disabled={isLoading}
+            placeholder={composerPlaceholder}
+          />
         </section>
 
         {detailsOpen ? (

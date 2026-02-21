@@ -21,9 +21,9 @@ export function ClarificationPrompt({
       <div className="flex flex-col gap-2">
         {options.map((option) => (
           <button
-            key={option.label}
+            key={`${option.label}-${option.selection}`}
             type="button"
-            onClick={() => onSelect(option.label)}
+            onClick={() => onSelect(option.selection)}
             disabled={disabled}
             className="group text-left rounded-md border border-border/60 bg-[var(--surface-primary)] p-3 transition-colors hover:border-[var(--accent-primary)] hover:bg-[var(--surface-secondary)] disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -36,6 +36,9 @@ export function ClarificationPrompt({
           </button>
         ))}
       </div>
+      <p className="mt-3 text-xs text-[var(--text-tertiary)]">
+        You can also type custom criteria in the chat box below.
+      </p>
     </div>
   );
 }
