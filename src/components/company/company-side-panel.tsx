@@ -52,7 +52,7 @@ function TextSection({ title, value }: { title: string; value: string | null }):
 export function CompanySidePanel({ company, onClose }: CompanySidePanelProps): React.JSX.Element {
   if (!company) {
     return (
-      <aside className="flex h-full items-center justify-center px-8 py-6">
+      <aside className="fixed inset-x-0 bottom-0 top-14 z-30 flex items-center justify-center bg-background px-8 py-6 lg:static lg:inset-auto lg:z-auto lg:h-full">
         <p className="text-sm text-[var(--text-secondary)]">Select a company reference to view full profile details.</p>
       </aside>
     );
@@ -99,7 +99,11 @@ export function CompanySidePanel({ company, onClose }: CompanySidePanelProps): R
     company.business_models.length > 0;
 
   return (
-    <aside role="complementary" aria-label="Company details panel" className="h-full overflow-y-auto px-8 py-6">
+    <aside
+      role="complementary"
+      aria-label="Company details panel"
+      className="fixed inset-x-0 bottom-0 top-14 z-30 overflow-y-auto bg-background px-8 py-6 lg:static lg:inset-auto lg:z-auto lg:h-full"
+    >
       <header className="pb-4">
         <div className="mb-3 flex items-start justify-between gap-3">
           <p className="section-header">Company Details</p>

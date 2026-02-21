@@ -126,8 +126,8 @@ export function ChatShell(): React.JSX.Element {
         </div>
       </header>
 
-      <div className={`min-h-0 flex-1 grid grid-cols-1 ${detailsOpen ? "lg:grid-cols-2" : ""}`}>
-        <section className={`flex min-h-0 flex-col ${detailsOpen ? "border-b border-border/60 lg:border-b-0 lg:border-r" : ""}`}>
+      <div className={`min-h-0 flex flex-1 flex-col ${detailsOpen ? "lg:grid lg:grid-cols-2" : ""}`}>
+        <section className={`flex min-h-0 flex-1 flex-col ${detailsOpen ? "lg:border-r lg:border-border/60" : ""}`}>
           <div className="min-h-0 flex-1">
             <MessageList
               messages={messages}
@@ -150,7 +150,7 @@ export function ChatShell(): React.JSX.Element {
         </section>
 
         {detailsOpen ? (
-          <section className="min-h-0">
+          <section className="fixed inset-x-0 bottom-0 top-14 z-20 min-h-0 bg-background lg:static lg:inset-auto lg:z-auto lg:flex-1">
             <CompanySidePanel company={selectedCompany} onClose={closeCompanyDetails} />
           </section>
         ) : null}
