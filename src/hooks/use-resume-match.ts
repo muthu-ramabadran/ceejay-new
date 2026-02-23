@@ -63,6 +63,22 @@ export function useResumeMatch(): UseResumeMatchResult {
     });
   }, []);
 
+  const parseEventLine = useCallback((line: string): ResumeStreamEvent | null => {
+    const raw = line.trim();
+    if (!raw) return null;
+
+    const payload = raw.startsWith("data:")
+      ? raw.slice(5).trim()
+      : raw;
+    if (!payload) return null;
+
+    try {
+      return JSON.parse(payload) as ResumeStreamEvent;
+    } catch {
+      return null;
+    }
+  }, []);
+
   const withTimeout = useCallback(async <T,>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> => {
     let timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -125,11 +141,13 @@ export function useResumeMatch(): UseResumeMatchResult {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      const processLine = (line: string) => {
-        const raw = line.trim();
-        if (!raw) return;
+      let receivedEvent = false;
+      let receivedFinalResults = false;
 
-        const event = JSON.parse(raw) as ResumeStreamEvent;
+      const processLine = (line: string) => {
+        const event = parseEventLine(line);
+        if (!event) return;
+        receivedEvent = true;
 
         if (!mountedRef.current) return;
 
@@ -143,7 +161,9 @@ export function useResumeMatch(): UseResumeMatchResult {
 
         if (event.type === "search_progress") {
           setSearchProgress((prev) => {
-            const query = event.data.currentQuery.trim();
+            const query = typeof event.data.currentQuery === "string"
+              ? event.data.currentQuery.trim()
+              : "";
             const recent = query
               ? [query, ...(prev?.recentQueries ?? []).filter((q) => q !== query)].slice(0, 6)
               : (prev?.recentQueries ?? []);
@@ -156,6 +176,7 @@ export function useResumeMatch(): UseResumeMatchResult {
         }
 
         if (event.type === "final_results") {
+          receivedFinalResults = true;
           setGroupedResults(event.data.groups);
           setCompaniesById(event.data.companiesById as Record<string, Company>);
           setPhase("results");
@@ -188,6 +209,14 @@ export function useResumeMatch(): UseResumeMatchResult {
       if (trailing) {
         processLine(trailing);
       }
+
+      if (!receivedFinalResults) {
+        throw new Error(
+          receivedEvent
+            ? "Resume processing stream ended before final results reached the browser. Please retry."
+            : "No progress events were received from the server. Please retry."
+        );
+      }
     } catch (err) {
       abortController.abort();
       if (mountedRef.current) {
@@ -203,7 +232,7 @@ export function useResumeMatch(): UseResumeMatchResult {
         setIsProcessing(false);
       }
     }
-  }, [updateActivity, withTimeout]);
+  }, [parseEventLine, updateActivity, withTimeout]);
 
   const reset = useCallback(() => {
     setPhase("upload");
