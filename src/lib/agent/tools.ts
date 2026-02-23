@@ -56,7 +56,7 @@ export interface SearchAgentState {
 
 export interface ToolContext {
   supabase: SupabaseClient;
-  embedQuery: (text: string) => Promise<number[]>;
+  embedQuery: (text: string) => Promise<{ embedding: number[]; durationMs: number }>;
   state: SearchAgentState;
   onActivity?: (event: AgentActivityEventPayload) => Promise<void> | void;
   onClarificationRequest?: (data: { question: string; options: ClarificationOption[] }) => void;
@@ -285,6 +285,7 @@ export function createSearchTools(ctx: ToolContext) {
       description: "Find a company by exact name using fuzzy + trigram matching.",
       inputSchema: exactNameSchema,
       execute: async ({ companyName }: z.infer<typeof exactNameSchema>) => {
+        const startedAt = Date.now();
         ctx.state.toolCallCount += 1;
         recordRetrievalQuery(ctx.state, companyName);
         const candidateCountBefore = ctx.state.candidates.size;
@@ -319,6 +320,7 @@ export function createSearchTools(ctx: ToolContext) {
           queryUsed: companyName,
           candidateCountBefore,
           candidateCountAfter,
+          durationMs: Date.now() - startedAt,
         };
       },
     }),
@@ -327,6 +329,7 @@ export function createSearchTools(ctx: ToolContext) {
       description: "Semantic retrieval across company profile fields (description/product/problem/customer/niches).",
       inputSchema: semanticSearchSchema,
       execute: async ({ query, searchFocus, excludeCompanyIds }: z.infer<typeof semanticSearchSchema>) => {
+        const startedAt = Date.now();
         ctx.state.toolCallCount += 1;
         recordRetrievalQuery(ctx.state, query);
         const candidateCountBefore = ctx.state.candidates.size;
@@ -337,7 +340,8 @@ export function createSearchTools(ctx: ToolContext) {
         const includeIds = ctx.state.constrainToCompanyIds ?? undefined;
         const limit = effectiveSearchLimit(ctx.state.targetResultCount);
 
-        const embedding = await ctx.embedQuery(query);
+        const embeddingResult = await ctx.embedQuery(query);
+        const embedding = embeddingResult.embedding;
 
         const rows = await searchHybrid(ctx.supabase, {
           queryText: query,
@@ -370,6 +374,8 @@ export function createSearchTools(ctx: ToolContext) {
           searchFocus: searchFocus ?? "broad",
           candidateCountBefore,
           candidateCountAfter,
+          embeddingDurationMs: embeddingResult.durationMs,
+          durationMs: Date.now() - startedAt,
         };
       },
     }),
@@ -378,6 +384,7 @@ export function createSearchTools(ctx: ToolContext) {
       description: "Lexical keyword retrieval for exact terminology and disambiguation.",
       inputSchema: keywordSearchSchema,
       execute: async ({ keywords }: z.infer<typeof keywordSearchSchema>) => {
+        const startedAt = Date.now();
         ctx.state.toolCallCount += 1;
         recordRetrievalQuery(ctx.state, keywords);
         const candidateCountBefore = ctx.state.candidates.size;
@@ -408,6 +415,7 @@ export function createSearchTools(ctx: ToolContext) {
           queryUsed: keywords,
           candidateCountBefore,
           candidateCountAfter,
+          durationMs: Date.now() - startedAt,
         };
       },
     }),
@@ -416,6 +424,7 @@ export function createSearchTools(ctx: ToolContext) {
       description: "Taxonomy filter using sector/category/business model labels.",
       inputSchema: taxonomySearchSchema,
       execute: async ({ sectors, categories, businessModels }: z.infer<typeof taxonomySearchSchema>) => {
+        const startedAt = Date.now();
         ctx.state.toolCallCount += 1;
         const taxonomySignature = [
           "taxonomy",
@@ -455,6 +464,7 @@ export function createSearchTools(ctx: ToolContext) {
           filtersUsed: { sectors, categories, businessModels },
           candidateCountBefore,
           candidateCountAfter,
+          durationMs: Date.now() - startedAt,
         };
       },
     }),
@@ -463,6 +473,7 @@ export function createSearchTools(ctx: ToolContext) {
       description: "Ask the user to choose intent when results are split across multiple plausible interpretations.",
       inputSchema: clarifySchema,
       execute: async ({ question, options }: z.infer<typeof clarifySchema>) => {
+        const startedAt = Date.now();
         ctx.state.clarificationPending = { question, options };
 
         if (ctx.onClarificationRequest) {
@@ -481,6 +492,7 @@ export function createSearchTools(ctx: ToolContext) {
             message: `User selected: "${selection}". Continue searching based on this choice.`,
             candidateCountBefore: ctx.state.candidates.size,
             candidateCountAfter: ctx.state.candidates.size,
+            durationMs: Date.now() - startedAt,
           };
         }
 
@@ -490,6 +502,7 @@ export function createSearchTools(ctx: ToolContext) {
           message: "Waiting for user to select an option. The search will resume after they respond.",
           candidateCountBefore: ctx.state.candidates.size,
           candidateCountAfter: ctx.state.candidates.size,
+          durationMs: Date.now() - startedAt,
         };
       },
     }),
@@ -498,6 +511,7 @@ export function createSearchTools(ctx: ToolContext) {
       description: "Fetch full company profiles for validation and ranking. Use multiple calls for large sets.",
       inputSchema: companyDetailsSchema,
       execute: async ({ companyIds }: z.infer<typeof companyDetailsSchema>) => {
+        const startedAt = Date.now();
         ctx.state.toolCallCount += 1;
         const candidateCountBefore = ctx.state.candidates.size;
         const constrainedIds = applyCompanyIdConstraints(companyIds, ctx.state).slice(0, 25);
@@ -534,6 +548,7 @@ export function createSearchTools(ctx: ToolContext) {
           })),
           candidateCountBefore,
           candidateCountAfter,
+          durationMs: Date.now() - startedAt,
         };
       },
     }),
@@ -542,6 +557,7 @@ export function createSearchTools(ctx: ToolContext) {
       description: "Finalize ranked companies after validation. Must follow active constraints and target count.",
       inputSchema: finalizeSchema,
       execute: async ({ rankedResults, overallConfidence, summary }: z.infer<typeof finalizeSchema>) => {
+        const startedAt = Date.now();
         const candidateCountBefore = ctx.state.candidates.size;
         const uniqueRetrievalQueryCount = new Set(ctx.state.retrievalQueryLog).size;
         if (ctx.state.companyDetailsFetchedCount <= 0) {
@@ -551,6 +567,7 @@ export function createSearchTools(ctx: ToolContext) {
             resultCount: 0,
             candidateCountBefore,
             candidateCountAfter: candidateCountBefore,
+            durationMs: Date.now() - startedAt,
           };
         }
 
@@ -561,6 +578,7 @@ export function createSearchTools(ctx: ToolContext) {
             resultCount: 0,
             candidateCountBefore,
             candidateCountAfter: candidateCountBefore,
+            durationMs: Date.now() - startedAt,
           };
         }
 
@@ -575,6 +593,7 @@ export function createSearchTools(ctx: ToolContext) {
             resultCount: 0,
             candidateCountBefore,
             candidateCountAfter: candidateCountBefore,
+            durationMs: Date.now() - startedAt,
           };
         }
 
@@ -590,6 +609,7 @@ export function createSearchTools(ctx: ToolContext) {
             resultCount: 0,
             candidateCountBefore,
             candidateCountAfter: candidateCountBefore,
+            durationMs: Date.now() - startedAt,
           };
         }
 
@@ -607,6 +627,7 @@ export function createSearchTools(ctx: ToolContext) {
           summary,
           candidateCountBefore,
           candidateCountAfter: ctx.state.candidates.size,
+          durationMs: Date.now() - startedAt,
         };
       },
     }),

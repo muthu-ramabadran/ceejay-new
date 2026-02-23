@@ -29,6 +29,7 @@ interface PendingClarification {
   state: SearchAgentState;
   messages: ChatMessage[];
   runId: string;
+  telemetryEnabled: boolean;
   startedAtMs: number;
   runtimePrompt: string;
   requestMode: AgentRequestMode;
@@ -277,7 +278,6 @@ function summarizeToolOutput(toolName: string, result: unknown): Record<string, 
   const data = result as Record<string, unknown>;
   switch (toolName) {
     case "search_exact_name":
-    case "search_semantic":
     case "search_keyword":
       return {
         totalFound: data.totalFound,
@@ -285,6 +285,15 @@ function summarizeToolOutput(toolName: string, result: unknown): Record<string, 
         topIds: Array.isArray(data.results)
           ? (data.results as Array<{ companyId: string }>).slice(0, 5).map((r) => r.companyId)
           : [],
+      };
+    case "search_semantic":
+      return {
+        totalFound: data.totalFound,
+        resultCount: Array.isArray(data.results) ? data.results.length : 0,
+        topIds: Array.isArray(data.results)
+          ? (data.results as Array<{ companyId: string }>).slice(0, 5).map((r) => r.companyId)
+          : [],
+        embeddingDurationMs: data.embeddingDurationMs,
       };
     case "search_taxonomy":
       return {
@@ -404,10 +413,12 @@ function buildFallbackResponse(message: string): FinalAnswerPayload {
 interface RunContext {
   supabase: ReturnType<typeof getSupabaseServerClient>;
   runId: string;
+  telemetryEnabled: boolean;
   startedAtMs: number;
   state: SearchAgentState;
   stepCounter: number;
   clarificationRequested: boolean;
+  toolDurationTotalMs: number;
 }
 
 export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<FinalAnswerPayload | null> {
@@ -433,7 +444,7 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
   });
 
   // Initialize search run telemetry
-  await insertSearchRun(supabase, {
+  const insertedRunId = await insertSearchRun(supabase, {
     id: runId,
     session_id: input.sessionId,
     query_text: userMessage,
@@ -444,6 +455,10 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
     end_reason: "in_progress",
     latency_ms: 0,
   });
+  const telemetryEnabled = insertedRunId !== null;
+  if (!telemetryEnabled) {
+    console.warn(`[agentic-orchestrator] Telemetry disabled for run ${runId}: search_runs insert failed.`);
+  }
 
   const state: SearchAgentState = {
     candidates: new Map(),
@@ -466,20 +481,35 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
   const context: RunContext = {
     supabase,
     runId,
+    telemetryEnabled,
     startedAtMs,
     state,
     stepCounter: 0,
     clarificationRequested: false,
+    toolDurationTotalMs: 0,
+  };
+  const logStepAsync = (payload: Parameters<typeof insertSearchRunStep>[1]): void => {
+    if (!context.telemetryEnabled) {
+      return;
+    }
+
+    void insertSearchRunStep(supabase, payload).catch((error) => {
+      console.error("insertSearchRunStep async write failed", error);
+    });
   };
 
   const tools = createSearchTools({
     supabase,
     embedQuery: async (text) => {
+      const startedAt = Date.now();
       const result = await embedMany({
         model: openai.embedding(env.OPENAI_EMBEDDING_MODEL),
         values: [text],
       });
-      return result.embeddings[0];
+      return {
+        embedding: result.embeddings[0],
+        durationMs: Date.now() - startedAt,
+      };
     },
     state,
     onActivity: input.onActivity,
@@ -500,6 +530,7 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
 
   try {
     // Phase 1: Agentic search - LLM decides tools based on results
+    const agentLoopStartedAt = Date.now();
     const agentResult = await generateText({
       model: openai(env.OPENAI_MODEL),
       system: buildAgentSystemMessage(runtimePrompt),
@@ -533,16 +564,21 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
             typeof resultRecord.candidateCountAfter === "number"
               ? resultRecord.candidateCountAfter
               : state.candidates.size;
+          const toolDurationMs =
+            typeof resultRecord.durationMs === "number" && Number.isFinite(resultRecord.durationMs)
+              ? Math.max(0, Math.round(resultRecord.durationMs))
+              : 0;
+          context.toolDurationTotalMs += toolDurationMs;
 
-          // Log to telemetry
-          await insertSearchRunStep(supabase, {
+          // Log to telemetry asynchronously so writes don't block the search loop.
+          logStepAsync({
             run_id: runId,
             iteration_no: 1,
             step_order: context.stepCounter,
             tool_name: `agent.${toolCall.toolName}`,
             input_summary: toolCall.input as Record<string, unknown>,
             output_summary: outputSummary,
-            duration_ms: 0,
+            duration_ms: toolDurationMs,
             candidate_count_before: candidateCountBefore,
             candidate_count_after: candidateCountAfter,
           });
@@ -563,6 +599,7 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
               state,
               messages: input.messages,
               runId,
+              telemetryEnabled: context.telemetryEnabled,
               startedAtMs,
               runtimePrompt,
               requestMode,
@@ -572,6 +609,30 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
           }
         }
       },
+    });
+    const agentLoopDurationMs = Date.now() - agentLoopStartedAt;
+    const agentNonToolMs = Math.max(0, agentLoopDurationMs - context.toolDurationTotalMs);
+    const agentUsage = (agentResult as { usage?: unknown }).usage ?? null;
+    context.stepCounter += 1;
+    logStepAsync({
+      run_id: runId,
+      iteration_no: 1,
+      step_order: context.stepCounter,
+      tool_name: "openai.generate_text.agent_loop",
+      input_summary: {
+        model: env.OPENAI_MODEL,
+        hasTools: true,
+      },
+      output_summary: {
+        finishReason: agentResult.finishReason,
+        stepCount: agentResult.steps.length,
+        toolExecutionMs: context.toolDurationTotalMs,
+        nonToolMs: agentNonToolMs,
+        usage: agentUsage,
+      },
+      duration_ms: agentLoopDurationMs,
+      candidate_count_before: 0,
+      candidate_count_after: state.candidates.size,
     });
 
     // Log agent reasoning for debugging
@@ -649,6 +710,7 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
       state.preliminaryResults.map((r) => r.companyId)
     );
 
+    const rerankerStartedAt = Date.now();
     const reranked = await generateObject({
       model: openai(env.OPENAI_MODEL),
       schema: rerankerSchema,
@@ -659,6 +721,28 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
         companyDetails,
         targetResultCount,
       }),
+    });
+    const rerankerDurationMs = Date.now() - rerankerStartedAt;
+    const rerankerUsage = (reranked as { usage?: unknown }).usage ?? null;
+    context.stepCounter += 1;
+    logStepAsync({
+      run_id: runId,
+      iteration_no: 1,
+      step_order: context.stepCounter,
+      tool_name: "openai.generate_object.reranker",
+      input_summary: {
+        model: env.OPENAI_MODEL,
+        candidateCount: state.preliminaryResults.length,
+      },
+      output_summary: {
+        confidence: reranked.object.confidence,
+        rankedCount: reranked.object.rankedCompanyIds.length,
+        perCompanyCount: reranked.object.perCompany.length,
+        usage: rerankerUsage,
+      },
+      duration_ms: rerankerDurationMs,
+      candidate_count_before: state.preliminaryResults.length,
+      candidate_count_after: state.preliminaryResults.length,
     });
 
     await input.onActivity?.({
@@ -712,9 +796,29 @@ export async function runAgenticSearch(input: AgentOrchestratorInput): Promise<F
 Requested ${targetResultCount} results. Returning ${references.length} companies. Top matches: ${references.slice(0, 3).map((r) => r.companyName).join(", ")}.
 Overall confidence: ${(rerankerData.confidence * 100).toFixed(0)}%. Focus on what was found, not the search process.`;
 
+    const summaryStartedAt = Date.now();
     const summaryResult = await generateText({
       model: openai(env.OPENAI_MODEL),
       prompt: summaryPrompt,
+    });
+    const summaryDurationMs = Date.now() - summaryStartedAt;
+    const summaryUsage = (summaryResult as { usage?: unknown }).usage ?? null;
+    context.stepCounter += 1;
+    logStepAsync({
+      run_id: runId,
+      iteration_no: 1,
+      step_order: context.stepCounter,
+      tool_name: "openai.generate_text.summary",
+      input_summary: {
+        model: env.OPENAI_MODEL,
+      },
+      output_summary: {
+        textLength: summaryResult.text.length,
+        usage: summaryUsage,
+      },
+      duration_ms: summaryDurationMs,
+      candidate_count_before: references.length,
+      candidate_count_after: references.length,
     });
 
     if (input.onPartialText) {
@@ -730,19 +834,21 @@ Overall confidence: ${(rerankerData.confidence * 100).toFixed(0)}%. Focus on wha
       latency_ms: Date.now() - startedAtMs,
     });
 
-    await insertSearchRunResults(
-      supabase,
-      references.map((ref, index) => ({
-        run_id: runId,
-        company_id: ref.companyId,
-        rank: index + 1,
-        confidence: ref.confidence,
-        evidence: {
-          evidenceChips: ref.evidenceChips,
-          reason: ref.reason,
-        },
-      }))
-    );
+    if (context.telemetryEnabled) {
+      await insertSearchRunResults(
+        supabase,
+        references.map((ref, index) => ({
+          run_id: runId,
+          company_id: ref.companyId,
+          rank: index + 1,
+          confidence: ref.confidence,
+          evidence: {
+            evidenceChips: ref.evidenceChips,
+            reason: ref.reason,
+          },
+        }))
+      );
+    }
 
     return {
       content: summaryResult.text,
@@ -805,15 +911,29 @@ export async function resumeAgentWithClarification(
 
   let stepCounter = pending.state.toolCallCount;
   let clarificationRequested = false;
+  let resumeToolDurationTotalMs = 0;
+  const logResumeStepAsync = (payload: Parameters<typeof insertSearchRunStep>[1]): void => {
+    if (!pending.telemetryEnabled) {
+      return;
+    }
+
+    void insertSearchRunStep(supabase, payload).catch((error) => {
+      console.error("insertSearchRunStep async write failed", error);
+    });
+  };
 
   const tools = createSearchTools({
     supabase,
     embedQuery: async (text) => {
+      const startedAt = Date.now();
       const result = await embedMany({
         model: openai.embedding(env.OPENAI_EMBEDDING_MODEL),
         values: [text],
       });
-      return result.embeddings[0];
+      return {
+        embedding: result.embeddings[0],
+        durationMs: Date.now() - startedAt,
+      };
     },
     state: pending.state,
     onActivity: input.onActivity,
@@ -843,7 +963,8 @@ export async function resumeAgentWithClarification(
     ];
 
     // Continue the agentic search
-    await generateText({
+    const resumeAgentLoopStartedAt = Date.now();
+    const resumeAgentResult = await generateText({
       model: openai(env.OPENAI_MODEL),
       system: buildAgentSystemMessage(pending.runtimePrompt),
       messages: resumeMessages,
@@ -875,15 +996,21 @@ export async function resumeAgentWithClarification(
             typeof resultRecord.candidateCountAfter === "number"
               ? resultRecord.candidateCountAfter
               : pending.state.candidates.size;
+          const toolDurationMs =
+            typeof resultRecord.durationMs === "number" && Number.isFinite(resultRecord.durationMs)
+              ? Math.max(0, Math.round(resultRecord.durationMs))
+              : 0;
+          resumeToolDurationTotalMs += toolDurationMs;
 
-          await insertSearchRunStep(supabase, {
+          // Log to telemetry asynchronously so writes don't block the search loop.
+          logResumeStepAsync({
             run_id: pending.runId,
             iteration_no: 2,
             step_order: stepCounter,
             tool_name: `agent.${toolCall.toolName}`,
             input_summary: toolCall.input as Record<string, unknown>,
             output_summary: outputSummary,
-            duration_ms: 0,
+            duration_ms: toolDurationMs,
             candidate_count_before: candidateCountBefore,
             candidate_count_after: candidateCountAfter,
           });
@@ -901,6 +1028,7 @@ export async function resumeAgentWithClarification(
               state: pending.state,
               messages: clarifiedMessages,
               runId: pending.runId,
+              telemetryEnabled: pending.telemetryEnabled,
               startedAtMs: pending.startedAtMs,
               runtimePrompt: pending.runtimePrompt,
               requestMode: pending.requestMode,
@@ -911,6 +1039,31 @@ export async function resumeAgentWithClarification(
         }
       },
     });
+    const resumeAgentLoopDurationMs = Date.now() - resumeAgentLoopStartedAt;
+    const resumeAgentNonToolMs = Math.max(0, resumeAgentLoopDurationMs - resumeToolDurationTotalMs);
+    const resumeAgentUsage = (resumeAgentResult as { usage?: unknown }).usage ?? null;
+    stepCounter += 1;
+    logResumeStepAsync({
+      run_id: pending.runId,
+      iteration_no: 2,
+      step_order: stepCounter,
+      tool_name: "openai.generate_text.agent_loop",
+      input_summary: {
+        model: env.OPENAI_MODEL,
+        hasTools: true,
+        resumed: true,
+      },
+      output_summary: {
+        finishReason: resumeAgentResult.finishReason,
+        stepCount: resumeAgentResult.steps.length,
+        toolExecutionMs: resumeToolDurationTotalMs,
+        nonToolMs: resumeAgentNonToolMs,
+        usage: resumeAgentUsage,
+      },
+      duration_ms: resumeAgentLoopDurationMs,
+      candidate_count_before: 0,
+      candidate_count_after: pending.state.candidates.size,
+    });
 
     if (clarificationRequested && pending.state.clarificationPending) {
       if (!pendingClarifications.has(sessionId)) {
@@ -919,6 +1072,7 @@ export async function resumeAgentWithClarification(
           state: pending.state,
           messages: clarifiedMessages,
           runId: pending.runId,
+          telemetryEnabled: pending.telemetryEnabled,
           startedAtMs: pending.startedAtMs,
           runtimePrompt: pending.runtimePrompt,
           requestMode: pending.requestMode,
@@ -989,6 +1143,7 @@ export async function resumeAgentWithClarification(
 
     const userMessage = clarifiedMessages.filter((m) => m.role === "user").at(-1)?.content?.trim() ?? "";
 
+    const resumeRerankerStartedAt = Date.now();
     const reranked = await generateObject({
       model: openai(env.OPENAI_MODEL),
       schema: rerankerSchema,
@@ -999,6 +1154,29 @@ export async function resumeAgentWithClarification(
         companyDetails,
         targetResultCount: pending.targetResultCount,
       }),
+    });
+    const resumeRerankerDurationMs = Date.now() - resumeRerankerStartedAt;
+    const resumeRerankerUsage = (reranked as { usage?: unknown }).usage ?? null;
+    stepCounter += 1;
+    logResumeStepAsync({
+      run_id: pending.runId,
+      iteration_no: 2,
+      step_order: stepCounter,
+      tool_name: "openai.generate_object.reranker",
+      input_summary: {
+        model: env.OPENAI_MODEL,
+        candidateCount: pending.state.preliminaryResults.length,
+        resumed: true,
+      },
+      output_summary: {
+        confidence: reranked.object.confidence,
+        rankedCount: reranked.object.rankedCompanyIds.length,
+        perCompanyCount: reranked.object.perCompany.length,
+        usage: resumeRerankerUsage,
+      },
+      duration_ms: resumeRerankerDurationMs,
+      candidate_count_before: pending.state.preliminaryResults.length,
+      candidate_count_after: pending.state.preliminaryResults.length,
     });
 
     await input.onActivity?.({
@@ -1049,9 +1227,30 @@ export async function resumeAgentWithClarification(
 Requested ${pending.targetResultCount} results. Returning ${references.length} companies. Top matches: ${references.slice(0, 3).map((r) => r.companyName).join(", ")}.
 Overall confidence: ${(rerankerData.confidence * 100).toFixed(0)}%. Focus on what was found.`;
 
+    const resumeSummaryStartedAt = Date.now();
     const summaryResult = await generateText({
       model: openai(env.OPENAI_MODEL),
       prompt: summaryPrompt,
+    });
+    const resumeSummaryDurationMs = Date.now() - resumeSummaryStartedAt;
+    const resumeSummaryUsage = (summaryResult as { usage?: unknown }).usage ?? null;
+    stepCounter += 1;
+    logResumeStepAsync({
+      run_id: pending.runId,
+      iteration_no: 2,
+      step_order: stepCounter,
+      tool_name: "openai.generate_text.summary",
+      input_summary: {
+        model: env.OPENAI_MODEL,
+        resumed: true,
+      },
+      output_summary: {
+        textLength: summaryResult.text.length,
+        usage: resumeSummaryUsage,
+      },
+      duration_ms: resumeSummaryDurationMs,
+      candidate_count_before: references.length,
+      candidate_count_after: references.length,
     });
 
     if (input.onPartialText) {
@@ -1066,19 +1265,21 @@ Overall confidence: ${(rerankerData.confidence * 100).toFixed(0)}%. Focus on wha
       latency_ms: Date.now() - pending.startedAtMs,
     });
 
-    await insertSearchRunResults(
-      supabase,
-      references.map((ref, index) => ({
-        run_id: pending.runId,
-        company_id: ref.companyId,
-        rank: index + 1,
-        confidence: ref.confidence,
-        evidence: {
-          evidenceChips: ref.evidenceChips,
-          reason: ref.reason,
-        },
-      }))
-    );
+    if (pending.telemetryEnabled) {
+      await insertSearchRunResults(
+        supabase,
+        references.map((ref, index) => ({
+          run_id: pending.runId,
+          company_id: ref.companyId,
+          rank: index + 1,
+          confidence: ref.confidence,
+          evidence: {
+            evidenceChips: ref.evidenceChips,
+            reason: ref.reason,
+          },
+        }))
+      );
+    }
 
     return {
       content: summaryResult.text,
