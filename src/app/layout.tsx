@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { Analytics } from "@vercel/analytics/react";
 
 import "@/app/globals.css";
 import "@fontsource/dm-sans/400.css";
@@ -21,7 +22,10 @@ export default function RootLayout({
 }>): React.JSX.Element {
   return (
     <html lang="en" className="dark">
-      <body className="font-sans antialiased">{children}</body>
+      <body className="font-sans antialiased">
+        {children}
+        <Analytics />
+      </body>
     </html>
   );
 }
